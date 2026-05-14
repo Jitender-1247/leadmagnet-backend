@@ -534,21 +534,32 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
             await page.evaluate(() => window.scrollBy(0, 600));
             await randomDelay(1000, 1500);
 
-            const pageUrls = await page.evaluate(() => {
-                const links = new Set();
-                document.querySelectorAll('a[href*="/in/"]').forEach(el => {
-                    const href = el.href.split('?')[0].replace(/\/$/, '');
-                    if (
-                        href &&
-                        href.includes('linkedin.com/in/') &&
-                        !href.includes('/in/undefined') &&
-                        !href.endsWith('/in/')
-                    ) {
-                        links.add(href);
-                    }
+            let pageUrls = [];
+            try {
+                pageUrls = await page.evaluate(() => {
+                    const links = new Set();
+                    document.querySelectorAll('a[href*="/in/"]').forEach(el => {
+                        const href = el.href.split('?')[0].replace(/\/$/, '');
+                        if (
+                            href &&
+                            href.includes('linkedin.com/in/') &&
+                            !href.includes('/in/undefined') &&
+                            !href.endsWith('/in/')
+                        ) {
+                            links.add(href);
+                        }
+                    });
+                    return [...links];
                 });
-                return [...links];
-            });
+            } catch (evalErr) {
+                if (evalErr.message.includes('detached')) {
+                    console.warn('   ⚠️ Frame detached on search page — retrying');
+                    await randomDelay(3000, 5000);
+                    pageNum++;
+                    continue;
+                }
+                throw evalErr;
+            }
 
             console.log(`   Found ${pageUrls.length} profiles on page ${pageNum + 1}`);
 
@@ -580,12 +591,43 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
             try {
                 await randomDelay(5000, 9000);
 
-                await page.goto(profileUrl, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 45000
-                }).catch(() => {
-                    console.warn(`⏱️ goto timeout — continuing with partial load`);
-                });
+                // Navigate with detached frame handling
+                try {
+                    await page.goto(profileUrl, {
+                        waitUntil: 'domcontentloaded',
+                        timeout: 45000
+                    });
+                } catch (navErr) {
+                    // "Navigating frame was detached" — LinkedIn opened a popup or redirected
+                    // Wait and check if we're still on a valid page
+                    if (navErr.message.includes('detached') || navErr.message.includes('timeout')) {
+                        console.warn(`   ⚠️ Navigation issue: ${navErr.message} — checking page state`);
+                        await randomDelay(3000, 5000);
+
+                        // Check if page is still usable
+                        try {
+                            const url = page.url();
+                            if (url.includes('/authwall') || url.includes('/login')) {
+                                console.warn('   🔐 Auth wall — stopping scrape');
+                                break;
+                            }
+                            // If we're on a different page but not auth wall, try to navigate again
+                            if (!url.includes(profileUrl.split('linkedin.com/in/')[1])) {
+                                await page.goto(profileUrl, {
+                                    waitUntil: 'domcontentloaded',
+                                    timeout: 30000
+                                }).catch(() => {});
+                            }
+                        } catch {
+                            // Page is completely broken — skip this profile
+                            console.warn('   ⚠️ Page unrecoverable — skipping profile');
+                            leads.push({ profileUrl, name: null, headline: null, location: null, company: null, about: null, profileImage: null });
+                            continue;
+                        }
+                    } else {
+                        throw navErr;
+                    }
+                }
 
                 // Auth wall check
                 const currentUrl = page.url();
@@ -599,43 +641,56 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                     break;
                 }
 
-                // ✅ Wait 10-15 seconds for full page render including images
-                const renderWait = Math.floor(Math.random() * 5000) + 10000;
-                console.log(`   ⏳ Waiting ${Math.round(renderWait / 1000)}s for full render...`);
+                // Wait for full render
+                const renderWait = Math.floor(Math.random() * 5000) + 8000;
+                console.log(`   ⏳ Waiting ${Math.round(renderWait / 1000)}s for render...`);
                 await randomDelay(renderWait, renderWait + 2000);
 
-                // ✅ Scroll through page to trigger lazy loading of all sections
-                await page.evaluate(() => window.scrollBy(0, 500));
-                await randomDelay(2000, 3000);
-                await page.evaluate(() => window.scrollBy(0, 500));
-                await randomDelay(2000, 3000);
-                await page.evaluate(() => window.scrollBy(0, 500));
-                await randomDelay(2000, 3000);
-                await page.evaluate(() => window.scrollBy(0, 500));
-                await randomDelay(2000, 3000);
-                // Scroll back to top — profile image is at the top
-                await page.evaluate(() => window.scrollTo(0, 0));
-                await randomDelay(2000, 3000);
+                // Scroll through page — wrap each in try/catch for detached frames
+                const scrollAmounts = [500, 500, 500, 500];
+                for (const amount of scrollAmounts) {
+                    try {
+                        await page.evaluate(a => window.scrollBy(0, a), amount);
+                        await randomDelay(1500, 2500);
+                    } catch (scrollErr) {
+                        if (scrollErr.message.includes('detached')) {
+                            console.warn('   ⚠️ Frame detached during scroll — skipping remaining scrolls');
+                            break;
+                        }
+                    }
+                }
 
-                const bodySnippet = await page.evaluate(() =>
-                    document.body ? document.body.innerText.slice(0, 200) : 'no body'
-                );
-                console.log(`📄 Preview: ${bodySnippet}`);
+                // Scroll back to top
+                try {
+                    await page.evaluate(() => window.scrollTo(0, 0));
+                    await randomDelay(1500, 2500);
+                } catch {}
 
-                const profileData = await extractProfileData(page);
-                console.log(`   ✅ Extracted:`, JSON.stringify(profileData));
+                // Extract data — wrap in try/catch for detached frames
+                let profileData = { name: null, headline: null, location: null, company: null, about: null, profileImage: null };
+                try {
+                    const bodySnippet = await page.evaluate(() =>
+                        document.body ? document.body.innerText.slice(0, 200) : 'no body'
+                    );
+                    console.log(`📄 Preview: ${bodySnippet}`);
+                    profileData = await extractProfileData(page);
+                    console.log(`   ✅ Extracted:`, JSON.stringify(profileData));
+                } catch (extractErr) {
+                    if (extractErr.message.includes('detached')) {
+                        console.warn('   ⚠️ Frame detached during extraction — saving partial data');
+                    } else {
+                        console.warn('   ⚠️ Extraction error:', extractErr.message);
+                    }
+                }
+
                 leads.push({ profileUrl, ...profileData });
 
             } catch (err) {
                 console.warn(`⚠️ Failed to scrape ${profileUrl}:`, err.message);
                 leads.push({
                     profileUrl,
-                    name: null,
-                    headline: null,
-                    location: null,
-                    company: null,
-                    about: null,
-                    profileImage: null
+                    name: null, headline: null, location: null,
+                    company: null, about: null, profileImage: null
                 });
             }
         }
