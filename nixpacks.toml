@@ -1,0 +1,36 @@
+# nixpacks.toml
+# Railway uses Nixpacks to build your app.
+# This config installs Chromium system dependencies needed for Puppeteer.
+
+[phases.setup]
+nixPkgs = [
+  "chromium",
+  "nss",
+  "nspr",
+  "atk",
+  "cups",
+  "dbus",
+  "expat",
+  "libdrm",
+  "libxkbcommon",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libxcb",
+  "mesa",
+  "pango",
+  "cairo",
+  "alsa-lib",
+]
+
+[phases.install]
+cmds = [
+  "npm install",
+  "npx puppeteer browsers install chrome || true"
+]
+
+[start]
+cmd = "npm start"

@@ -1,0 +1,30 @@
+{
+  "name": "lead-back",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node ./bin/www"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "~1.4.4",
+    "cors": "^2.8.6",
+    "crypto": "^1.0.1",
+    "debug": "~2.6.9",
+    "dotenv": "^17.3.1",
+    "ejs": "~2.6.1",
+    "express": "~4.16.1",
+    "express-rate-limit": "^8.5.1",
+    "firebase": "^12.11.0",
+    "firebase-admin": "^13.7.0",
+    "http-errors": "~1.6.3",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "~1.9.1",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^8.0.3",
+    "puppeteer": "^24.40.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "uuid": "^13.0.0"
+  }
+}
