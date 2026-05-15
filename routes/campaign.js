@@ -216,7 +216,6 @@ router.post('/:campaignId/import-leads', authMiddleware, importLeadsLimiter, asy
 
   if (!searchUrl) return res.status(400).json({ error: 'searchUrl is required' });
 
-  // Clamp maxLeads between 10 and 100
   const limit = Math.min(100, Math.max(10, parseInt(maxLeads) || 25));
 
   try {
@@ -234,6 +233,88 @@ router.post('/:campaignId/import-leads', authMiddleware, importLeadsLimiter, asy
     res.json({ success: true, leadsImported: leads.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/v1/campaigns/:campaignId/launch ─────────────────────────────────
+// Full auto: scrape leads → immediately start sending connections
+// This is the "paste URL and go" endpoint — no manual steps needed
+router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (req, res) => {
+  const { campaignId }          = req.params;
+  const { searchUrl, maxLeads } = req.body;
+  const uid                     = req.user.uid;
+
+  if (!searchUrl) return res.status(400).json({ error: 'searchUrl is required' });
+  if (!searchUrl.includes('linkedin.com')) {
+    return res.status(400).json({ error: 'Must be a LinkedIn search URL' });
+  }
+
+  const limit = Math.min(100, Math.max(10, parseInt(maxLeads) || 25));
+
+  try {
+    const campaignDoc = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignDoc.exists || campaignDoc.data().userId !== uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (campaignDoc.data().isRunning) {
+      return res.status(409).json({ error: 'Campaign is already running' });
+    }
+
+    const userDoc = await db.collection('users').doc(uid).get();
+    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+
+    const userData = userDoc.data();
+    if (!userData.linkedinSession) {
+      return res.status(400).json({ error: 'LinkedIn not connected. Please connect LinkedIn first.' });
+    }
+
+    // Respond immediately — run everything in background
+    res.json({
+      success: true,
+      status:  'launching',
+      message: '🚀 Launching! Scraping profiles then sending connections automatically...',
+    });
+
+    // Run scrape + campaign in background (fire and forget)
+    ;(async () => {
+      try {
+        console.log(`[launch] 🔍 Scraping ${limit} leads for campaign ${campaignId}`);
+
+        const { scrapeLeads }  = require('../services/linkedinService');
+        const { enqueueJob, getCampaignQueueStatus } = require('../services/queueService');
+        const { runCampaign }  = require('../services/automationService');
+
+        // Step 1 — Scrape leads
+        const leads = await scrapeLeads(uid, userData.linkedinSession, searchUrl, campaignId, limit);
+        console.log(`[launch] ✅ Scraped ${leads.length} leads`);
+
+        if (leads.length === 0) {
+          console.log('[launch] No leads found — stopping');
+          return;
+        }
+
+        // Step 2 — Auto-start campaign
+        console.log(`[launch] 🚀 Auto-starting campaign ${campaignId}`);
+        const job = await enqueueJob(campaignId, uid);
+
+        if (job.runNow) {
+          await runCampaign(campaignId);
+          console.log(`[launch] ✅ Campaign completed`);
+        } else {
+          console.log(`[launch] ⏰ Campaign queued for ${job.scheduledLabel}`);
+        }
+
+      } catch (err) {
+        console.error(`[launch] ❌ Error:`, err.message);
+      }
+    })();
+
+  } catch (err) {
+    // Only reaches here if something fails before res.json()
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 

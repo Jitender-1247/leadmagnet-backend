@@ -428,8 +428,8 @@ async function extractProfileData(page) {
 // ── Helper: create a configured page with cookie ─────────────────────────────
 async function makeScrapePage(browser, liAt) {
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60000);
-    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(90000);
+    page.setDefaultTimeout(90000);
 
     await page.setRequestInterception(true);
     page.on('request', req => {
@@ -451,7 +451,18 @@ async function makeScrapePage(browser, liAt) {
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-    await page.setCookie({ name: 'li_at', value: liAt, domain: '.linkedin.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' });
+
+    // Must visit the domain FIRST before setting cookie — otherwise cookie won't attach
+    await page.goto('https://www.linkedin.com', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000
+    }).catch(() => {});
+
+    await page.setCookie({
+        name: 'li_at', value: liAt,
+        domain: '.linkedin.com', path: '/',
+        httpOnly: true, secure: true, sameSite: 'None'
+    });
 
     return page;
 }
@@ -465,11 +476,20 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         // Verify session
         console.log('🔐 Verifying session...');
         const sessionPage = await makeScrapePage(browser, liAt);
-        await sessionPage.goto('https://www.linkedin.com/feed', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        // Use networkidle2 with longer timeout for Railway/cloud environments
+        await sessionPage.goto('https://www.linkedin.com/feed', {
+            waitUntil: 'domcontentloaded',
+            timeout: 90000  // 90s — datacenter connections are slower
+        }).catch(err => {
+            console.warn('⚠️ Feed load timeout — checking URL anyway:', err.message);
+        });
 
         const loggedIn = await isLoggedIn(sessionPage);
         if (!loggedIn) {
-            await sessionPage.reload({ waitUntil: 'domcontentloaded' });
+            await randomDelay(3000, 5000);
+            await sessionPage.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
+                .catch(() => {});
             if (!await isLoggedIn(sessionPage)) {
                 await sessionPage.close();
                 await browser.close();
