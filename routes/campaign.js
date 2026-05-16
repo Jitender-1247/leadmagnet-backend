@@ -344,7 +344,7 @@ router.post('/:campaignId/start', authMiddleware, campaignStartLimiter, async (r
       return res.status(400).json({ error: 'Campaign must be active to start' });
     }
 
-    const { enqueueJob } = require('../services/queueService');
+    const { enqueueJob } = require('../services/Queueservice');
     const { isSafeToRun, runCampaign } = require('../services/automationService');
 
     const job = await enqueueJob(campaignId, uid);

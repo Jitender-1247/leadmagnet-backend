@@ -10,6 +10,7 @@ dotenv.config();
 var indexRouter = require('./routes/index');
 var scheduler = require('./services/Scheduler');
 var app = express();
+app.set('trust proxy', 1);
 
 // Middleware
 app.use(logger('dev'));
