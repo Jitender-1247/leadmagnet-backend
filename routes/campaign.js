@@ -292,7 +292,7 @@ router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (re
         console.log(`[launch] 🔍 Scraping ${limit} leads for campaign ${campaignId}`);
 
         const { scrapeLeads }  = require('../services/linkedinService');
-        const { enqueueJob }   = require('../services/queueService');
+        const { enqueueJob }   = require('../services/Queueservice');
         const { runCampaign }  = require('../services/automationService');
 
         // Step 1 — Scrape leads
@@ -374,7 +374,7 @@ router.post('/:campaignId/start', authMiddleware, campaignStartLimiter, async (r
       return res.status(400).json({ error: 'Campaign must be active to start' });
     }
 
-    const { enqueueJob } = require('../services/queueService');
+    const { enqueueJob } = require('../services/Queueservice');
     const { isSafeToRun, runCampaign } = require('../services/automationService');
 
     const job = await enqueueJob(campaignId, uid);
@@ -431,7 +431,7 @@ router.get('/:campaignId/queue-status', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { getCampaignQueueStatus } = require('../services/queueService');
+    const { getCampaignQueueStatus } = require('../services/Queueservice');
     const status = await getCampaignQueueStatus(campaignId);
 
     res.json({ queued: !!status, job: status });
@@ -451,7 +451,7 @@ router.post('/:campaignId/cancel-queue', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { cancelCampaignJobs } = require('../services/queueService');
+    const { cancelCampaignJobs } = require('../services/Queueservice');
     const cancelled = await cancelCampaignJobs(campaignId);
 
     res.json({ success: true, cancelled });
