@@ -239,8 +239,6 @@ router.post('/:campaignId/import-leads', authMiddleware, importLeadsLimiter, asy
 });
 
 // ── POST /api/v1/campaigns/:campaignId/launch ─────────────────────────────────
-// Full auto: scrape leads → immediately start sending connections
-// This is the "paste URL and go" endpoint — no manual steps needed
 router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (req, res) => {
   const { campaignId }          = req.params;
   const { searchUrl, maxLeads } = req.body;
@@ -254,7 +252,9 @@ router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (re
   const limit = Math.min(100, Math.max(10, parseInt(maxLeads) || 25));
 
   try {
-    const campaignDoc = await db.collection('campaigns').doc(campaignId).get();
+    const campaignRef = db.collection('campaigns').doc(campaignId);
+    const campaignDoc = await campaignRef.get();
+
     if (!campaignDoc.exists || campaignDoc.data().userId !== uid) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -271,49 +271,79 @@ router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (re
       return res.status(400).json({ error: 'LinkedIn not connected. Please connect LinkedIn first.' });
     }
 
-    // Respond immediately — run everything in background
+    // Mark as scraping immediately
+    await campaignRef.update({
+      launchStatus:  'scraping',
+      launchError:   null,
+      lastLaunchAt:  new Date().toISOString(),
+      leadsScraped:  0,
+    });
+
+    // Respond immediately
     res.json({
       success: true,
       status:  'launching',
       message: '🚀 Launching! Scraping profiles then sending connections automatically...',
     });
 
-    // Run scrape + campaign in background (fire and forget)
+    // Run in background
     ;(async () => {
       try {
         console.log(`[launch] 🔍 Scraping ${limit} leads for campaign ${campaignId}`);
 
         const { scrapeLeads }  = require('../services/linkedinService');
-        const { enqueueJob, getCampaignQueueStatus } = require('../services/Queueservice');
+        const { enqueueJob }   = require('../services/queueService');
         const { runCampaign }  = require('../services/automationService');
 
         // Step 1 — Scrape leads
         const leads = await scrapeLeads(uid, userData.linkedinSession, searchUrl, campaignId, limit);
         console.log(`[launch] ✅ Scraped ${leads.length} leads`);
 
+        await campaignRef.update({
+          leadsScraped: leads.length,
+        });
+
         if (leads.length === 0) {
-          console.log('[launch] No leads found — stopping');
+          await campaignRef.update({
+            launchStatus: 'error',
+            launchError:  'No profiles found. Check your LinkedIn search URL and filters.',
+          });
           return;
         }
 
         // Step 2 — Auto-start campaign
+        await campaignRef.update({ launchStatus: 'running' });
         console.log(`[launch] 🚀 Auto-starting campaign ${campaignId}`);
+
         const job = await enqueueJob(campaignId, uid);
 
         if (job.runNow) {
           await runCampaign(campaignId);
+          await campaignRef.update({
+            launchStatus: 'done',
+            launchError:  null,
+          });
           console.log(`[launch] ✅ Campaign completed`);
         } else {
+          await campaignRef.update({
+            launchStatus:    'queued',
+            launchScheduled: job.scheduledLabel,
+            launchError:     null,
+          });
           console.log(`[launch] ⏰ Campaign queued for ${job.scheduledLabel}`);
         }
 
       } catch (err) {
         console.error(`[launch] ❌ Error:`, err.message);
+        await campaignRef.update({
+          launchStatus: 'error',
+          launchError:  err.message,
+          isRunning:    false,
+        }).catch(() => {});
       }
     })();
 
   } catch (err) {
-    // Only reaches here if something fails before res.json()
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
     }
@@ -344,7 +374,7 @@ router.post('/:campaignId/start', authMiddleware, campaignStartLimiter, async (r
       return res.status(400).json({ error: 'Campaign must be active to start' });
     }
 
-    const { enqueueJob } = require('../services/Queueservice');
+    const { enqueueJob } = require('../services/queueService');
     const { isSafeToRun, runCampaign } = require('../services/automationService');
 
     const job = await enqueueJob(campaignId, uid);
@@ -401,7 +431,7 @@ router.get('/:campaignId/queue-status', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { getCampaignQueueStatus } = require('../services/Queueservice');
+    const { getCampaignQueueStatus } = require('../services/queueService');
     const status = await getCampaignQueueStatus(campaignId);
 
     res.json({ queued: !!status, job: status });
@@ -421,7 +451,7 @@ router.post('/:campaignId/cancel-queue', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { cancelCampaignJobs } = require('../services/Queueservice');
+    const { cancelCampaignJobs } = require('../services/queueService');
     const cancelled = await cancelCampaignJobs(campaignId);
 
     res.json({ success: true, cancelled });
