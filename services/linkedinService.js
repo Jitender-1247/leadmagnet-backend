@@ -427,7 +427,22 @@ async function extractProfileData(page) {
 
 // ── Helper: create a configured page with cookie ─────────────────────────────
 async function makeScrapePage(browser, liAt) {
-    const page = await browser.newPage();
+    // Small delay before creating each new page — prevents Chrome overload
+    await randomDelay(500, 1500);
+
+    let page;
+    // Retry page creation up to 3 times if it times out
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            page = await browser.newPage();
+            break;
+        } catch (err) {
+            console.warn(`   ⚠️ newPage attempt ${attempt} failed: ${err.message}`);
+            if (attempt === 3) throw err;
+            await randomDelay(3000, 5000);
+        }
+    }
+
     page.setDefaultNavigationTimeout(90000);
     page.setDefaultTimeout(90000);
 

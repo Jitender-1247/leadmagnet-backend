@@ -99,6 +99,7 @@ function getLaunchConfig(extraArgs = []) {
 
   return {
     headless: 'new',
+    protocolTimeout: 120000,  // ← fixes "Network.enable timed out"
     ...(executablePath && { executablePath }),
     args: [
       '--no-sandbox',
@@ -111,9 +112,18 @@ function getLaunchConfig(extraArgs = []) {
       '--disable-features=IsolateOrigins,site-per-process',
       '--disable-web-security',
       '--window-size=1280,800',
+      '--disable-http2',
+      '--ignore-certificate-errors',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-extensions',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--js-flags=--max-old-space-size=512',
       ...extraArgs,
     ],
-    defaultViewport: null,
+    defaultViewport: { width: 1280, height: 800 },
   };
 }
 

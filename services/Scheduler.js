@@ -11,7 +11,7 @@ const cron = require('node-cron');
 const { db } = require('../config/firebase');
 const { runCampaign, checkForReplies, isSafeToRun, processFollowUps } = require('./automationService');
 const { decrypt } = require('./linkedinService');
-const { processQueue } = require('./Queueservice');
+const { processQueue } = require('./queueService');
 
 /**
  * ── Queue processor — every minute ───────────────────────────────────────────
