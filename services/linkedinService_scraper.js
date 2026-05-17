@@ -330,6 +330,7 @@ async function submitLinkedInOtp(uid, otp) {
 // ── Helper: extract profile data with multiple selector fallbacks ───────────
 async function extractProfileData(page) {
     return await page.evaluate(() => {
+        /* NOTE: this entire block runs inside the browser — no Node.js scope */
 
         const bodyLines = document.body.innerText
             .split('\n')
@@ -546,11 +547,27 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                     break;
                 }
 
-                await sp.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
-                await randomDelay(1000, 1500);
-                await sp.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
-                await randomDelay(1000, 1500);
+                // Guard: if the page frame detached during navigation (LinkedIn
+                // redirect / checkpoint), treat this search page as empty and move on.
+                const isDetached = () => {
+                    try { sp.url(); return false; } catch { return true; }
+                };
 
+                if (isDetached()) {
+                    console.warn(`   ⚠️ Frame detached after navigation — skipping search page ${pageNum + 1}`);
+                    await sp.close().catch(() => {});
+                    pageNum++;
+                    await randomDelay(3000, 5000);
+                    continue;
+                }
+
+                // Safe scroll — each call individually guarded
+                await sp.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
+                if (!isDetached()) await randomDelay(1000, 1500);
+                await sp.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
+                if (!isDetached()) await randomDelay(1000, 1500);
+
+                // Safe URL extraction — returns [] if frame died mid-evaluate
                 const urls = await sp.evaluate(() => {
                     const links = new Set();
                     document.querySelectorAll('a[href*="/in/"]').forEach(el => {
@@ -559,7 +576,18 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                             links.add(href);
                     });
                     return [...links];
-                }).catch(() => []);
+                }).catch(err => {
+                    // Detached frame during evaluate — not a crash, just no URLs this page
+                    if (
+                        err.message.includes('detached Frame') ||
+                        err.message.includes('Execution context was destroyed') ||
+                        err.message.includes('Target closed')
+                    ) {
+                        console.warn(`   ⚠️ Frame detached during URL extraction on page ${pageNum + 1} — skipping`);
+                        return [];
+                    }
+                    throw err; // Re-throw real errors
+                });
 
                 console.log(`   Page ${pageNum + 1}: ${urls.length} profiles found`);
                 if (urls.length === 0) { await sp.close(); break; }
@@ -618,7 +646,11 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 await randomDelay(1000, 2000);
 
                 const profileData = await extractProfileData(pp).catch(err => {
-                    console.warn('   ⚠️ Extract error:', err.message);
+                    const isDetachError =
+                        err.message.includes('detached Frame') ||
+                        err.message.includes('Execution context was destroyed') ||
+                        err.message.includes('Target closed');
+                    console.warn(`   ⚠️ Extract error${isDetachError ? ' (frame detached)' : ''}:`, err.message.slice(0, 80));
                     return { name: null, headline: null, location: null, company: null, about: null, profileImage: null };
                 });
 
