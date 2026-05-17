@@ -116,30 +116,14 @@ function isFrameError(err) {
 // ── safeGoto — never throws a frame error, returns true/false ───────────────
 async function safeGoto(page, url, opts = {}) {
     const options = { waitUntil: 'domcontentloaded', timeout: 60000, ...opts };
-    let detachResolve;
-    const detachPromise = new Promise(resolve => { detachResolve = resolve; });
-    const onDetach = () => detachResolve(false);
-    page.on('framedetached', onDetach);
     try {
-        const result = await Promise.race([
-            page.goto(url, options).then(() => true).catch(err => {
-                if (isFrameError(err) || err.message.includes('timeout')) return false;
-                throw err;
-            }),
-            detachPromise,
-        ]);
-        page.off('framedetached', onDetach);
-        if (!result) {
-            console.warn(`   ⚠️ safeGoto: navigation failed — ${url.slice(0, 70)}`);
-            await new Promise(r => setTimeout(r, 3000));
-            return false;
-        }
+        await page.goto(url, options);
+        // Settle delay — let LinkedIn's redirect scripts fire before we touch the page
         await randomDelay(2000, 3000);
         return true;
     } catch (err) {
-        page.off('framedetached', onDetach);
-        if (isFrameError(err) || err.message.includes('timeout')) {
-            console.warn(`   ⚠️ safeGoto error — ${err.message.slice(0, 80)}`);
+        if (isFrameError(err) || err.message.includes('timeout') || err.message.includes('net::ERR')) {
+            console.warn(`   ⚠️ safeGoto: navigation failed — ${url.slice(0, 70)}`);
             await new Promise(r => setTimeout(r, 3000));
             return false;
         }
