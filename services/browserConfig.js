@@ -11,8 +11,25 @@ const path = require('path');
 
 function findChrome() {
 
+  // ── 0. Project-local .cache (set by .puppeteerrc.cjs) ────────────────────
+  // This is the most reliable — Puppeteer installs here via npx puppeteer browsers install
+  try {
+    const localBase = path.join(process.cwd(), '.cache', 'puppeteer', 'chrome');
+    if (fs.existsSync(localBase)) {
+      const versions = fs.readdirSync(localBase)
+        .filter(d => d.startsWith('linux-'))
+        .sort().reverse();
+      for (const v of versions) {
+        const p = path.join(localBase, v, 'chrome-linux64', 'chrome');
+        if (fs.existsSync(p)) {
+          console.log(`[browser] ✅ Local cache Chrome found at: ${p}`);
+          return p;
+        }
+      }
+    }
+  } catch {}
+
   // ── 1. Railway — Nixpacks installs system Chromium ───────────────────────
-  // Railway uses Nix, so Chromium is at the system level
   const railwayPaths = [
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
@@ -29,7 +46,7 @@ function findChrome() {
     }
   }
 
-  // ── 2. Puppeteer downloaded Chrome (Railway fallback) ────────────────────
+  // ── 2. Home directory .cache (Railway/Render fallback) ────────────────────
   try {
     const home = process.env.HOME || '/root';
     const base = path.join(home, '.cache', 'puppeteer', 'chrome');
@@ -40,7 +57,7 @@ function findChrome() {
       for (const v of versions) {
         const p = path.join(base, v, 'chrome-linux64', 'chrome');
         if (fs.existsSync(p)) {
-          console.log(`[browser] ✅ Puppeteer Chrome found at: ${p}`);
+          console.log(`[browser] ✅ Home cache Chrome found at: ${p}`);
           return p;
         }
       }
