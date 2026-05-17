@@ -580,7 +580,31 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         while (allProfileUrls.size < maxLeads && pageNum < maxPages) {
             const sp = await makeScrapePage(browser, liAt);
             try {
-                await sp.goto(`${searchUrl}&start=${pageNum * 10}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                // Catch ALL frame-detach variants from goto — LinkedIn destroys
+                // the frame mid-navigation on checkpoint redirects.
+                const gotoErr = await sp.goto(`${searchUrl}&start=${pageNum * 10}`, {
+                    waitUntil: 'domcontentloaded', timeout: 60000
+                }).then(() => null).catch(err => err);
+
+                if (gotoErr) {
+                    const msg = gotoErr.message || '';
+                    const isFrameError =
+                        msg.includes('detached Frame') ||
+                        msg.includes('Navigating frame was detached') ||
+                        msg.includes('Execution context was destroyed') ||
+                        msg.includes('Target closed') ||
+                        msg.includes('Session closed') ||
+                        msg.includes('net::ERR_ABORTED');
+                    if (isFrameError) {
+                        console.warn(`   ⚠️ Navigation aborted on search page ${pageNum + 1} (${msg.slice(0, 60)}) — skipping`);
+                        await sp.close().catch(() => {});
+                        pageNum++;
+                        await randomDelay(4000, 7000);
+                        continue;
+                    }
+                    throw gotoErr; // real error — bubble up
+                }
+
                 await randomDelay(3000, 4000);
 
                 if (!await isLoggedIn(sp)) {
@@ -641,7 +665,18 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 } else { emptyCount = 0; }
 
             } catch (err) {
-                console.warn(`   Search page ${pageNum + 1} error:`, err.message);
+                const msg = err.message || '';
+                const isFrameError =
+                    msg.includes('detached Frame') ||
+                    msg.includes('Navigating frame was detached') ||
+                    msg.includes('Execution context was destroyed') ||
+                    msg.includes('Target closed') ||
+                    msg.includes('Session closed');
+                if (isFrameError) {
+                    console.warn(`   ⚠️ Frame error on search page ${pageNum + 1} — skipping:`, msg.slice(0, 80));
+                } else {
+                    console.warn(`   Search page ${pageNum + 1} error:`, msg);
+                }
             } finally {
                 try { await sp.close(); } catch {}
             }
@@ -737,6 +772,8 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         // Translate low-level Puppeteer frame errors into actionable messages
         if (
             err.message.includes('detached Frame') ||
+            err.message.includes('Navigating frame was detached') ||
+            err.message.includes('Execution context was destroyed') ||
             err.message.includes('Target closed') ||
             err.message.includes('Session closed')
         ) {
