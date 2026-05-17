@@ -630,17 +630,10 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 continue;
             }
 
-            // Check session still valid
-            const stillLoggedIn = await isLoggedIn(page);
-            if (!stillLoggedIn) {
-                console.warn('⚠️ Session lost during search — stopping');
-                break;
-            }
-
             await safeEval(page, () => window.scrollBy(0, 600), null);
-            await randomDelay(1500, 2500);
+            await randomDelay(2500, 3500);
             await safeEval(page, () => window.scrollBy(0, 600), null);
-            await randomDelay(1500, 2500);
+            await randomDelay(2500, 3500);
 
             const pageUrls = await safeEval(page, () => {
                 const links = new Set();
