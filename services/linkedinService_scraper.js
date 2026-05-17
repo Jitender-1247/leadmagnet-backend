@@ -101,7 +101,23 @@ async function fetchLinkedInUserData(page) {
 async function isLoggedIn(page) {
     // Wait a moment for any redirect to happen
     await randomDelay(3000, 4000);
-    const url = page.url();
+
+    let url;
+    try {
+        url = page.url();
+    } catch (err) {
+        // Frame detached during the redirect — treat as not logged in
+        if (
+            err.message.includes('detached Frame') ||
+            err.message.includes('Target closed') ||
+            err.message.includes('Session closed')
+        ) {
+            console.warn('   ⚠️ Frame detached during login check — treating as not logged in');
+            return false;
+        }
+        throw err;
+    }
+
     console.log('   🔍 Current URL after wait:', url);
     return (
         !url.includes('/login') &&
@@ -503,30 +519,56 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
     const browser = await puppeteer.launch(getLaunchConfig());
 
     try {
-        // Verify session
+        // ── Session verification ─────────────────────────────────────────────
+        // We verify by navigating to /feed and checking the resulting URL.
+        // LinkedIn sometimes redirects /feed to a checkpoint/search page and
+        // destroys the frame mid-navigation — we catch that here so it never
+        // surfaces as an unhandled "detached Frame" crash.
         console.log('🔐 Verifying session...');
-        const sessionPage = await makeScrapePage(browser, liAt);
+        let sessionValid = false;
 
-        // Use networkidle2 with longer timeout for Railway/cloud environments
-        await sessionPage.goto('https://www.linkedin.com/feed', {
-            waitUntil: 'domcontentloaded',
-            timeout: 90000  // 90s — datacenter connections are slower
-        }).catch(err => {
-            console.warn('⚠️ Feed load timeout — checking URL anyway:', err.message);
-        });
+        try {
+            const sessionPage = await makeScrapePage(browser, liAt);
 
-        const loggedIn = await isLoggedIn(sessionPage);
-        if (!loggedIn) {
-            await randomDelay(3000, 5000);
-            await sessionPage.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
-                .catch(() => {});
-            if (!await isLoggedIn(sessionPage)) {
-                await sessionPage.close();
-                await browser.close();
-                throw new Error('LinkedIn session expired. Please reconnect.');
+            await sessionPage.goto('https://www.linkedin.com/feed', {
+                waitUntil: 'domcontentloaded',
+                timeout: 90000,
+            }).catch(err => {
+                // Timeout or frame detach during navigation — isLoggedIn will
+                // check the URL (or return false if the frame is already dead)
+                console.warn('⚠️ Feed navigation issue:', err.message.slice(0, 80));
+            });
+
+            sessionValid = await isLoggedIn(sessionPage);
+
+            if (!sessionValid) {
+                // One retry — wait and reload
+                await randomDelay(3000, 5000);
+                await sessionPage.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
+                    .catch(() => {});
+                sessionValid = await isLoggedIn(sessionPage);
+            }
+
+            await sessionPage.close().catch(() => {});
+        } catch (err) {
+            // Catch any residual detached-frame error from the session check
+            if (
+                err.message.includes('detached Frame') ||
+                err.message.includes('Target closed') ||
+                err.message.includes('Session closed')
+            ) {
+                console.warn('⚠️ Session page frame detached — will attempt scrape anyway');
+                // sessionValid stays false → will throw below
+            } else {
+                throw err;
             }
         }
-        await sessionPage.close();
+
+        if (!sessionValid) {
+            await browser.close();
+            throw new Error('LinkedIn session expired or blocked. Please reconnect LinkedIn in Settings.');
+        }
+
         console.log('✅ Session valid');
 
         // Collect profile URLs — one page per search result page
@@ -692,8 +734,18 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         return leads;
 
     } catch (err) {
+        // Translate low-level Puppeteer frame errors into actionable messages
+        if (
+            err.message.includes('detached Frame') ||
+            err.message.includes('Target closed') ||
+            err.message.includes('Session closed')
+        ) {
+            console.error('❌ scrapeLeads: browser frame detached (LinkedIn redirect/checkpoint):', err.message.slice(0, 80));
+            try { await browser.close(); } catch {}
+            throw new Error('LinkedIn interrupted the scrape (checkpoint or redirect). Please try again in a few minutes.');
+        }
         console.error('❌ scrapeLeads error:', err.message);
-        await browser.close();
+        try { await browser.close(); } catch {}
         throw err;
     }
 }
