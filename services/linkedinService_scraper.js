@@ -65,22 +65,44 @@ function isFrameError(err) {
 }
 
 // ── safeGoto — the ONLY way we navigate anywhere ─────────────────────────────
-// Returns true on success, false on any frame/network error.
-// NEVER throws a frame error — callers get a boolean to decide what to do.
+// Returns true on success, false on ANY frame/network/detach error.
+// Uses a race between the goto promise and a framedetached event so we
+// catch the error no matter whether Puppeteer surfaces it synchronously
+// or via an unhandled rejection.
 async function safeGoto(page, url, opts = {}) {
     const options = { waitUntil: 'domcontentloaded', timeout: 90000, ...opts };
+
+    // Build a promise that resolves false the instant the frame detaches,
+    // regardless of what goto is doing at that moment.
+    let detachResolve;
+    const detachPromise = new Promise(resolve => { detachResolve = resolve; });
+    const onDetach = () => detachResolve(false);
+    page.on('framedetached', onDetach);
+
     try {
-        await page.goto(url, options);
-        // Give LinkedIn's redirect scripts time to fire and settle
-        // BEFORE we touch the page again. This is critical — most frame
-        // detach errors happen because we read page.url() in the 200-500ms
-        // window after goto resolves but before LinkedIn's redirect completes.
-        await randomDelay(2000, 3000);
+        const result = await Promise.race([
+            page.goto(url, options).then(() => true).catch(err => {
+                if (isFrameError(err) || err.message.includes('timeout')) return false;
+                throw err;
+            }),
+            detachPromise,
+        ]);
+
+        page.off('framedetached', onDetach);
+
+        if (!result) {
+            console.warn(`   ⚠️ safeGoto: frame detached or navigation failed — ${url.slice(0, 70)}`);
+            await new Promise(r => setTimeout(r, 3000));
+            return false;
+        }
+
+        // Settle delay — let LinkedIn's redirect scripts fire before we touch the page
+        await randomDelay(2000, 3500);
         return true;
     } catch (err) {
+        page.off('framedetached', onDetach);
         if (isFrameError(err) || err.message.includes('timeout')) {
-            console.warn(`   ⚠️ safeGoto: navigation issue to ${url.slice(0, 70)}: ${err.message.slice(0, 60)}`);
-            // Extra settle time after a failed navigation
+            console.warn(`   ⚠️ safeGoto: caught error — ${err.message.slice(0, 80)}`);
             await new Promise(r => setTimeout(r, 3000));
             return false;
         }
