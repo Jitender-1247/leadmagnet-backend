@@ -594,47 +594,51 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         }
         console.log('✅ Session valid — proceeding to search');
 
-        // ── 2. Collect profile URLs from search result pages ──────────────────
+        // ── 2. Collect profile URLs — max 3 search pages ────────────────────
         console.log('🔍 Navigating to search URL...');
         const allProfileUrls = new Set();
-        let pageNum   = 0;
-        const maxPages = Math.ceil(maxLeads / 10) + 2;
+        // Hard cap: only scrape 3 search pages (30 results max) regardless of maxLeads.
+        // More pages = more LinkedIn redirects = more frame detach risk.
+        const MAX_SEARCH_PAGES = 3;
         let emptyStreak = 0;
 
-        while (allProfileUrls.size < maxLeads && pageNum < maxPages) {
+        for (let pageNum = 0; pageNum < MAX_SEARCH_PAGES; pageNum++) {
+            if (allProfileUrls.size >= maxLeads) break;
+
             const targetUrl = `${searchUrl}&start=${pageNum * 10}`;
-            console.log(`   Scraping search page ${pageNum + 1}: ${targetUrl}`);
+            console.log(`📄 Scraping search page ${pageNum + 1}: ${targetUrl}`);
 
+            // safeGoto returns false instead of throwing on frame detach
             const navOk = await safeGoto(page, targetUrl, { timeout: 60000 });
-
             if (!navOk) {
-                // Frame detached during navigation — wait longer and retry once
-                console.warn(`   ⚠️ Navigation failed on search page ${pageNum + 1} — waiting 8s and retrying`);
-                await randomDelay(8000, 12000);
-                const retryOk = await safeGoto(page, targetUrl, { timeout: 60000 });
-                if (!retryOk) {
-                    console.warn(`   ⚠️ Retry also failed — skipping page ${pageNum + 1}`);
-                    pageNum++;
-                    continue;
-                }
+                console.warn(`   ⚠️ Navigation failed on page ${pageNum + 1} — skipping`);
+                await randomDelay(5000, 8000);
+                continue;
             }
 
+            // Let the page settle — don't call isLoggedIn here as it races
+            // against LinkedIn's lazy-load redirects on later pages.
+            // Instead just check the URL directly via safeEval.
             await randomDelay(3000, 4000);
 
-            // Check session still valid after navigation
-            const stillLoggedIn = await isLoggedIn(page);
-            if (!stillLoggedIn) {
-                console.warn('⚠️ Session lost during scrape — stopping');
+            const currentUrl = await safeEval(page, () => window.location.href, '');
+            if (
+                currentUrl.includes('/authwall') ||
+                currentUrl.includes('/login') ||
+                currentUrl.includes('checkpoint') ||
+                currentUrl.includes('/uas/')
+            ) {
+                console.warn('⚠️ Session lost or checkpoint hit — stopping search');
                 break;
             }
 
-            // Scroll to load lazy content
-            await safeEval(page, () => window.scrollBy(0, 600), null);
-            await randomDelay(1000, 1500);
-            await safeEval(page, () => window.scrollBy(0, 600), null);
-            await randomDelay(1000, 1500);
+            // Scroll to trigger lazy-load
+            await safeEval(page, () => window.scrollBy(0, 700), null);
+            await randomDelay(1200, 1800);
+            await safeEval(page, () => window.scrollBy(0, 700), null);
+            await randomDelay(1200, 1800);
 
-            // Extract profile URLs
+            // Extract profile URLs — safeEval returns [] if frame dies
             const urls = await safeEval(page, () => {
                 const links = new Set();
                 document.querySelectorAll('a[href*="/in/"]').forEach(el => {
@@ -647,23 +651,24 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                     ) links.add(href);
                 });
                 return [...links];
-            }, []); // fallback = empty array if frame dies
+            }, []);
 
-            console.log(`   Page ${pageNum + 1}: ${urls.length} profiles found`);
+            console.log(`   Found ${urls.length} profiles on page ${pageNum + 1}`);
 
             if (urls.length === 0) {
-                if (++emptyStreak >= 2) break;
+                if (++emptyStreak >= 2) {
+                    console.log('   No more results — stopping search');
+                    break;
+                }
             } else {
                 emptyStreak = 0;
-                const before = allProfileUrls.size;
                 urls.forEach(u => allProfileUrls.add(u));
-                if (allProfileUrls.size === before) {
-                    if (++emptyStreak >= 2) break;
-                }
             }
 
-            pageNum++;
-            await randomDelay(3000, 5000);
+            // Gap between pages
+            if (pageNum < MAX_SEARCH_PAGES - 1) {
+                await randomDelay(4000, 6000);
+            }
         }
 
         const profileUrls = [...allProfileUrls].slice(0, maxLeads);
