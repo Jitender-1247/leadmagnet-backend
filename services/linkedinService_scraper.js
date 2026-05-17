@@ -293,7 +293,7 @@ async function submitLinkedInOtp(uid, otp) {
                     const isVisible = await page.evaluate(el => {
                         const rect = el.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0;
-                    }, el);
+                    }, el).catch(() => false);
                     if (isVisible) { otpInput = selector; break; }
                 }
             } catch { continue; }
@@ -309,7 +309,7 @@ async function submitLinkedInOtp(uid, otp) {
             input.focus(); input.value = otp;
             input.dispatchEvent(new Event('input',  { bubbles: true }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
-        }, otpInput, otp);
+        }, otpInput, otp).catch(() => {});
 
         await randomDelay(800, 1500);
 
