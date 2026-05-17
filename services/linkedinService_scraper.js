@@ -10,7 +10,6 @@ puppeteer.use(StealthPlugin());
 const IV_LENGTH = 16;
 const activeSessions = {};
 
-// ── Lazy-read ENCRYPTION_KEY so dotenv is always loaded first ───────────────
 function getKey() {
     const key = process.env.ENCRYPTION_KEY;
     if (!key) throw new Error('ENCRYPTION_KEY is not set in environment variables');
@@ -38,20 +37,96 @@ function decrypt(text) {
     return decrypted.toString();
 }
 
-function randomDelay(min = 500, max = 1500) {
+// ── Realistic human delays ────────────────────────────────────────────────────
+// These are NOT short delays — LinkedIn's bot detection looks for sub-human speed.
+function randomDelay(min = 2000, max = 4000) {
     return new Promise(resolve =>
         setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min)
     );
 }
 
-// ── Grab profile image + name from LinkedIn nav after login ──────────────────
+// ── THE permanent frame-error solution ───────────────────────────────────────
+// One central detector used everywhere. Add new strings here if LinkedIn
+// introduces new error variants — fix in one place, fixed everywhere.
+function isFrameError(err) {
+    if (!err) return false;
+    const msg = err.message || String(err);
+    return (
+        msg.includes('detached Frame')              ||
+        msg.includes('Navigating frame was detached')||
+        msg.includes('Execution context was destroyed') ||
+        msg.includes('Target closed')               ||
+        msg.includes('Session closed')              ||
+        msg.includes('net::ERR_ABORTED')            ||
+        msg.includes('Cannot find context')         ||
+        msg.includes('Attempted to use detached')   ||
+        msg.includes('Frame was detached')
+    );
+}
+
+// ── safeGoto — the ONLY way we navigate anywhere ─────────────────────────────
+// Returns true on success, false on any frame/network error.
+// NEVER throws a frame error — callers get a boolean to decide what to do.
+async function safeGoto(page, url, opts = {}) {
+    const options = { waitUntil: 'domcontentloaded', timeout: 90000, ...opts };
+    try {
+        await page.goto(url, options);
+        // Give LinkedIn's redirect scripts time to fire and settle
+        // BEFORE we touch the page again. This is critical — most frame
+        // detach errors happen because we read page.url() in the 200-500ms
+        // window after goto resolves but before LinkedIn's redirect completes.
+        await randomDelay(2000, 3000);
+        return true;
+    } catch (err) {
+        if (isFrameError(err) || err.message.includes('timeout')) {
+            console.warn(`   ⚠️ safeGoto: navigation issue to ${url.slice(0, 70)}: ${err.message.slice(0, 60)}`);
+            // Extra settle time after a failed navigation
+            await new Promise(r => setTimeout(r, 3000));
+            return false;
+        }
+        throw err;
+    }
+}
+
+// ── safeEval — the ONLY way we run evaluate ──────────────────────────────────
+// Returns fallback value on any frame error instead of throwing.
+async function safeEval(page, fn, fallback = null, ...args) {
+    try {
+        return await page.evaluate(fn, ...args);
+    } catch (err) {
+        if (isFrameError(err)) {
+            console.warn(`   ⚠️ safeEval: frame error — returning fallback`);
+            return fallback;
+        }
+        throw err;
+    }
+}
+
+// ── safeUrl — read current URL without ever crashing ─────────────────────────
+async function safeUrl(page) {
+    // We use safeEval via window.location.href instead of page.url()
+    // because page.url() calls into the CDP session directly and throws
+    // if the frame is detached, while evaluate() goes through our guard.
+    return await safeEval(page, () => window.location.href, '') || '';
+}
+
+// ── isAuthWall — check if LinkedIn kicked us out ─────────────────────────────
+async function isAuthWall(page) {
+    const url = await safeUrl(page);
+    return (
+        url.includes('/authwall') ||
+        url.includes('/login')    ||
+        url.includes('checkpoint')||
+        url.includes('/uas/')     ||
+        url === ''  // safeUrl returns '' when frame is dead
+    );
+}
+
+// ── fetchLinkedInUserData ─────────────────────────────────────────────────────
 async function fetchLinkedInUserData(page) {
     try {
-        // Wait for nav to fully load
         await randomDelay(2000, 3000);
-
-        const data = await page.evaluate(() => {
-            // Profile image — LinkedIn nav avatar selectors
+        const data = await safeEval(page, () => {
             const imgSelectors = [
                 'img.global-nav__me-photo',
                 '.global-nav__me img',
@@ -60,7 +135,6 @@ async function fetchLinkedInUserData(page) {
                 'button[data-control-name="identity_welcome_message"] img',
                 '.artdeco-entity-lockup__image img',
             ];
-
             let profileImage = null;
             for (const sel of imgSelectors) {
                 const el = document.querySelector(sel);
@@ -69,25 +143,18 @@ async function fetchLinkedInUserData(page) {
                     break;
                 }
             }
-
-            // Display name from nav
             const nameSelectors = [
                 '.global-nav__me-content .t-14',
                 '.global-nav__me-content span[class*="t-"]',
                 '[data-control-name="identity_welcome_message"] span',
             ];
-
             let displayName = null;
             for (const sel of nameSelectors) {
                 const el = document.querySelector(sel);
-                if (el && el.innerText?.trim()) {
-                    displayName = el.innerText.trim();
-                    break;
-                }
+                if (el && el.innerText?.trim()) { displayName = el.innerText.trim(); break; }
             }
-
             return { profileImage, displayName };
-        });
+        }, { profileImage: null, displayName: null });
 
         console.log('📸 LinkedIn user data fetched:', data.displayName, data.profileImage ? '(image found)' : '(no image)');
         return data;
@@ -97,90 +164,53 @@ async function fetchLinkedInUserData(page) {
     }
 }
 
-// ── Helper: reliable login check using URL instead of DOM element ────────────
-async function isLoggedIn(page) {
-    // Wait a moment for any redirect to happen
-    await randomDelay(3000, 4000);
-
-    let url;
-    try {
-        url = page.url();
-    } catch (err) {
-        // Frame detached during the redirect — treat as not logged in
-        if (
-            err.message.includes('detached Frame') ||
-            err.message.includes('Target closed') ||
-            err.message.includes('Session closed')
-        ) {
-            console.warn('   ⚠️ Frame detached during login check — treating as not logged in');
-            return false;
-        }
-        throw err;
-    }
-
-    console.log('   🔍 Current URL after wait:', url);
-    return (
-        !url.includes('/login') &&
-        !url.includes('/authwall') &&
-        !url.includes('/uas/') &&
-        !url.includes('checkpoint')
-    );
-}
-
-// ── STEP 1 — Login with email + password, trigger OTP ──────────────────────
+// ── STEP 1 — Initiate LinkedIn login ─────────────────────────────────────────
 async function initiateLinkedInLogin(uid, email, password) {
     const browser = await puppeteer.launch(getLaunchConfig());
-
     try {
         const page = await browser.newPage();
-
         await page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+            Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         });
-
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
         console.log('🌐 Navigating to LinkedIn...');
-        await page.goto('https://www.linkedin.com/login', {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000
-        });
+        await safeGoto(page, 'https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
 
-        await randomDelay(1000, 2000);
-        await page.type('#username', email, { delay: 120 });
-        await randomDelay(500, 1000);
-        await page.type('#password', password, { delay: 100 });
-        await randomDelay(500, 1000);
+        // Check the field actually exists before typing
+        const usernameEl = await page.$('#username');
+        if (!usernameEl) {
+            await browser.close();
+            return { success: false, message: 'LinkedIn login page did not load correctly' };
+        }
+        console.log('   ✅ Email field found: #username');
+
+        await randomDelay(1500, 2500);
+        await page.type('#username', email, { delay: 150 });
+        await randomDelay(800, 1500);
+        await page.type('#password', password, { delay: 120 });
+        await randomDelay(800, 1500);
         await page.click('[type=submit]');
 
         await page.waitForFunction(
             () => !window.location.href.includes('/login'),
             { timeout: 30000 }
-        );
+        ).catch(() => {});
 
-        await randomDelay(2000, 3000);
-        const currentUrl = page.url();
+        await randomDelay(3000, 5000);
+        const currentUrl = await safeUrl(page);
         console.log('📍 After login URL:', currentUrl);
 
-        // ✅ Already logged in — no OTP needed
-        if (
-            currentUrl.includes('/feed') ||
-            currentUrl.includes('/mynetwork') ||
-            currentUrl.includes('/jobs') ||
-            currentUrl.includes('/home')
-        ) {
+        if (currentUrl.includes('/feed') || currentUrl.includes('/mynetwork') ||
+            currentUrl.includes('/jobs') || currentUrl.includes('/home')) {
             const cookies = await page.cookies('https://www.linkedin.com');
             const liAt = cookies.find(c => c.name === 'li_at');
-
             if (liAt) {
                 const encryptedCookie = encrypt(liAt.value);
-
-                // Fetch profile image + name from nav
                 const { profileImage, displayName } = await fetchLinkedInUserData(page);
-
                 await db.collection('users').doc(uid).update({
                     linkedinSession:     encryptedCookie,
                     linkedinEmail:       email,
@@ -196,60 +226,40 @@ async function initiateLinkedInLogin(uid, email, password) {
             }
         }
 
-        // 🔐 OTP required — keep browser alive
-        if (
-            currentUrl.includes('checkpoint') ||
-            currentUrl.includes('verify') ||
-            currentUrl.includes('pin') ||
-            currentUrl.includes('challenge')
-        ) {
+        if (currentUrl.includes('checkpoint') || currentUrl.includes('verify') ||
+            currentUrl.includes('pin') || currentUrl.includes('challenge')) {
             console.log('🔐 OTP page detected — waiting for user input...');
             activeSessions[uid] = { browser, page };
-
             setTimeout(() => {
                 if (activeSessions[uid]) {
-                    console.log('🧹 Cleaning up session for', uid);
-                    activeSessions[uid].browser.close();
+                    activeSessions[uid].browser.close().catch(() => {});
                     delete activeSessions[uid];
                 }
             }, 10 * 60 * 1000);
-
-            return { success: false, requiresOtp: true, message: 'OTP sent to your email/phone — submit it to complete login' };
+            return { success: false, requiresOtp: true, message: 'OTP sent — submit it to complete login' };
         }
 
         await browser.close();
         return { success: false, message: `Unexpected page after login: ${currentUrl}` };
-
     } catch (err) {
         console.error('❌ LinkedIn login error:', err.message);
-        await browser.close();
+        try { await browser.close(); } catch {}
         return { success: false, message: err.message };
     }
 }
 
-// ── STEP 2 — Submit OTP using the same browser session ─────────────────────
+// ── STEP 2 — Submit OTP ───────────────────────────────────────────────────────
 async function submitLinkedInOtp(uid, otp) {
     const session = activeSessions[uid];
-
-    if (!session) {
-        return { success: false, message: 'Session expired or not found. Please restart the login process.' };
-    }
+    if (!session) return { success: false, message: 'Session expired. Please restart the login process.' };
 
     const { browser, page } = session;
-
     try {
         console.log('🔑 Submitting OTP...');
-
         const otpSelectors = [
-            'input[name="pin"]',
-            'input[id="input__email_verification_pin"]',
-            'input[autocomplete="one-time-code"]',
-            'input[aria-label*="verification"]',
-            'input[aria-label*="pin"]',
-            '#app__container input[type="text"]',
-            '#app__container input[type="number"]',
-            'input[type="text"]',
-            'input[type="number"]'
+            'input[name="pin"]', 'input[id="input__email_verification_pin"]',
+            'input[autocomplete="one-time-code"]', 'input[aria-label*="verification"]',
+            'input[aria-label*="pin"]', 'input[type="text"]', 'input[type="number"]'
         ];
 
         let otpInput = null;
@@ -262,68 +272,48 @@ async function submitLinkedInOtp(uid, otp) {
                         const rect = el.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0;
                     }, el);
-                    if (isVisible) {
-                        otpInput = selector;
-                        break;
-                    }
+                    if (isVisible) { otpInput = selector; break; }
                 }
             } catch { continue; }
         }
 
         if (!otpInput) {
-            await browser.close();
-            delete activeSessions[uid];
-            return { success: false, message: 'Could not find OTP input field on the page' };
+            await browser.close(); delete activeSessions[uid];
+            return { success: false, message: 'Could not find OTP input field' };
         }
 
         await page.evaluate((selector, otp) => {
             const input = document.querySelector(selector);
-            input.focus();
-            input.value = otp;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.focus(); input.value = otp;
+            input.dispatchEvent(new Event('input',  { bubbles: true }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
         }, otpInput, otp);
 
-        await randomDelay(500, 1000);
+        await randomDelay(800, 1500);
 
-        const submitSelectors = [
-            '[type=submit]',
-            'button[aria-label*="verify"]',
-            'button[aria-label*="submit"]',
-            'button:not([aria-label*="back"])'
-        ];
-
-        for (const selector of submitSelectors) {
+        for (const selector of ['[type=submit]', 'button[aria-label*="verify"]', 'button:not([aria-label*="back"])']) {
             try {
                 const btn = await page.$(selector);
-                if (btn) {
-                    await btn.evaluate(b => b.click());
-                    break;
-                }
+                if (btn) { await btn.evaluate(b => b.click()); break; }
             } catch { continue; }
         }
 
         await page.waitForFunction(
             () => window.location.href.includes('/feed') || window.location.href.includes('/mynetwork'),
             { timeout: 30000 }
-        );
+        ).catch(() => {});
 
-        await randomDelay(1000, 2000);
-
+        await randomDelay(2000, 3000);
         const cookies = await page.cookies('https://www.linkedin.com');
         const liAt = cookies.find(c => c.name === 'li_at');
 
         if (!liAt) {
-            await browser.close();
-            delete activeSessions[uid];
+            await browser.close(); delete activeSessions[uid];
             return { success: false, message: 'OTP accepted but could not extract session cookie' };
         }
 
         const encryptedCookie = encrypt(liAt.value);
-
-        // Fetch profile image + name from nav
         const { profileImage, displayName } = await fetchLinkedInUserData(page);
-
         await db.collection('users').doc(uid).update({
             linkedinSession:     encryptedCookie,
             linkedinConnectedAt: new Date().toISOString(),
@@ -331,79 +321,46 @@ async function submitLinkedInOtp(uid, otp) {
             ...(displayName  && { linkedinDisplayName:  displayName  }),
         });
 
-        await browser.close();
-        delete activeSessions[uid];
+        await browser.close(); delete activeSessions[uid];
         return { success: true, message: 'LinkedIn connected successfully ✅' };
-
     } catch (err) {
         console.error('❌ OTP error:', err.message);
-        await browser.close();
+        try { await browser.close(); } catch {}
         delete activeSessions[uid];
         return { success: false, message: err.message };
     }
 }
 
-// ── Helper: extract profile data with multiple selector fallbacks ───────────
+// ── extractProfileData ────────────────────────────────────────────────────────
 async function extractProfileData(page) {
-    return await page.evaluate(() => {
-        /* NOTE: this entire block runs inside the browser — no Node.js scope */
-
+    return await safeEval(page, () => {
         const bodyLines = document.body.innerText
-            .split('\n')
-            .map(l => l.trim())
-            .filter(l => l.length > 0);
+            .split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-        // ── Find "For Business" line — name always comes right after ────────
         const forBusinessIdx = bodyLines.lastIndexOf('For Business');
-
         let name = null, headline = null, location = null;
 
         if (forBusinessIdx !== -1) {
-            // Skip any empty/garbage lines after "For Business"
             const skipWords = ['Try Premium', 'Join now', 'Sign in', 'Advertisement'];
-            
             let nameIdx = forBusinessIdx + 1;
-            // Skip ad/promo lines
-            while (
-                nameIdx < bodyLines.length &&
-                skipWords.some(w => bodyLines[nameIdx].includes(w))
-            ) {
-                nameIdx++;
-            }
-
+            while (nameIdx < bodyLines.length && skipWords.some(w => bodyLines[nameIdx].includes(w))) nameIdx++;
             name     = bodyLines[nameIdx]     || null;
             headline = bodyLines[nameIdx + 1] || null;
-
-            // Location comes after "Message" button which follows the name repeat
-            // Structure: Name, Headline, Message, Name(repeat), Headline(repeat), Location
             const messageIdx = bodyLines.findIndex(
                 (l, i) => i > nameIdx && (l === 'Message' || l === 'Connect' || l === 'Pending')
             );
-
             if (messageIdx !== -1) {
-                // After "Message": skip repeated name + headline, grab location
-                // location is usually 2-3 lines after Message
                 const candidateLines = bodyLines.slice(messageIdx + 1, messageIdx + 6);
-                
-                // Location looks like "City, State" or "City, Country"
-                // Skip lines that match name or headline (repeated)
                 location = candidateLines.find(l =>
-                    l !== name &&
-                    l !== headline &&
-                    l.length > 2 &&
-                    !l.includes('Try Premium') &&
-                    !l.includes('Connect') &&
-                    !l.includes('Message') &&
-                    !l.includes('Follow') &&
-                    !l.includes('She/') &&   // skip pronouns
-                    !l.includes('He/') &&
-                    !l.includes('They/') &&
+                    l !== name && l !== headline && l.length > 2 &&
+                    !l.includes('Try Premium') && !l.includes('Connect') &&
+                    !l.includes('Message') && !l.includes('Follow') &&
+                    !l.includes('She/') && !l.includes('He/') && !l.includes('They/') &&
                     (l.includes(',') || l.includes('Area') || l.length < 40)
                 ) || null;
             }
         }
 
-        // ── Company from experience section ──────────────────────────────────
         const getText = (selectors) => {
             for (const sel of selectors) {
                 const el = document.querySelector(sel);
@@ -416,13 +373,10 @@ async function extractProfileData(page) {
             '.pv-text-details__right-panel .hoverable-link-text span[aria-hidden="true"]',
             '#experience ~ div .pvs-entity span[aria-hidden="true"]',
         ]);
-
         const about = getText([
             '#about ~ div span[aria-hidden="true"]',
             '#about ~ div span',
         ]);
-
-                // ✅ More robust profile image selectors
         const imgEl = document.querySelector([
             'img.pv-top-card-profile-picture__image--show',
             'img.profile-photo-edit__preview',
@@ -434,46 +388,31 @@ async function extractProfileData(page) {
             'section img[height="200"]',
             'section img[width="200"]',
         ].join(', '));
-
         const profileImage = imgEl?.src || null;
 
         return { name, headline, location, company, about, profileImage };
-    });
+    }, { name: null, headline: null, location: null, company: null, about: null, profileImage: null });
 }
 
-
-// ── Helper: create a configured page with cookie ─────────────────────────────
+// ── makeScrapePage ────────────────────────────────────────────────────────────
 async function makeScrapePage(browser, liAt) {
-    // Small delay before creating each new page — prevents Chrome overload
-    await randomDelay(500, 1500);
+    await randomDelay(1000, 2000);
 
     let page;
     for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            page = await browser.newPage();
-            break;
-        } catch (err) {
+        try { page = await browser.newPage(); break; }
+        catch (err) {
             console.warn(`   ⚠️ newPage attempt ${attempt} failed: ${err.message}`);
             if (attempt === 3) throw err;
-            await randomDelay(3000, 5000);
+            await randomDelay(4000, 6000);
         }
     }
 
     page.setDefaultNavigationTimeout(90000);
     page.setDefaultTimeout(90000);
 
-    // ── Permanent frame detached fix ─────────────────────────────────────────
-    // Suppress unhandled errors from detached frames — they're expected on LinkedIn
     page.on('error', err => {
-        if (err.message.includes('detached') || err.message.includes('Target closed')) {
-            console.warn('   ⚠️ Page error (suppressed):', err.message.slice(0, 60));
-        }
-    });
-    page.on('pageerror', err => {
-        // Suppress LinkedIn's own JS errors that trigger frame detachment
-        if (err.message.includes('detached')) {
-            console.warn('   ⚠️ Page script error (suppressed)');
-        }
+        if (isFrameError(err)) console.warn('   ⚠️ Page error (suppressed):', err.message.slice(0, 60));
     });
 
     await page.setRequestInterception(true);
@@ -481,11 +420,7 @@ async function makeScrapePage(browser, liAt) {
         const type = req.resourceType();
         const url  = req.url();
         if (['media', 'font'].includes(type)) { req.abort(); return; }
-        if (type === 'image') {
-            url.includes('licdn.com') ? req.continue() : req.abort();
-            return;
-        }
-        // Abort requests from detached frames — prevents cascade errors
+        if (type === 'image') { url.includes('licdn.com') ? req.continue() : req.abort(); return; }
         try { req.continue(); } catch {}
     });
 
@@ -498,11 +433,10 @@ async function makeScrapePage(browser, liAt) {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-    // Must visit domain first before setting cookie
-    await page.goto('https://www.linkedin.com', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000
-    }).catch(() => {});
+    // ── KEY FIX: use safeGoto even for the domain warm-up ────────────────────
+    // The old code used raw page.goto here — this is where most frame detaches
+    // were happening before scraping even started.
+    await safeGoto(page, 'https://www.linkedin.com', { waitUntil: 'domcontentloaded' });
 
     await page.setCookie({
         name: 'li_at', value: liAt,
@@ -513,142 +447,81 @@ async function makeScrapePage(browser, liAt) {
     return page;
 }
 
-// ── STEP 3 — Scrape leads ─────────────────────────────────────────────────────
-// ── Universal frame-error detector ──────────────────────────────────────────
-function isFrameError(err) {
-    const msg = (err && err.message) ? err.message : String(err);
-    return (
-        msg.includes('detached Frame') ||
-        msg.includes('Navigating frame was detached') ||
-        msg.includes('Execution context was destroyed') ||
-        msg.includes('Target closed') ||
-        msg.includes('Session closed') ||
-        msg.includes('net::ERR_ABORTED') ||
-        msg.includes('Cannot find context') ||
-        msg.includes('Attempted to use detached')
-    );
-}
-
-// ── Safe goto — NEVER throws a frame error, returns true/false ───────────────
-// This is the single choke-point for all navigation. If LinkedIn destroys the
-// frame during navigation, we catch it here and return false so callers can
-// decide whether to retry or skip — without ever crashing.
-async function safeGoto(page, url, opts = {}) {
-    const options = { waitUntil: 'domcontentloaded', timeout: 60000, ...opts };
-    try {
-        await page.goto(url, options);
-        return true;
-    } catch (err) {
-        if (isFrameError(err)) {
-            console.warn(`   ⚠️ safeGoto: frame detached navigating to ${url.slice(0, 80)} — (${err.message.slice(0, 60)})`);
-            return false;
-        }
-        throw err; // real errors (network down, bad URL) still surface
-    }
-}
-
-// ── Safe evaluate — NEVER throws a frame error, returns fallback value ────────
-async function safeEval(page, fn, fallback = null, ...args) {
-    try {
-        return await page.evaluate(fn, ...args);
-    } catch (err) {
-        if (isFrameError(err)) {
-            console.warn(`   ⚠️ safeEval: frame detached during evaluate — returning fallback`);
-            return fallback;
-        }
-        throw err;
-    }
-}
-
-// ── STEP 3 — Scrape leads ─────────────────────────────────────────────────────
+// ── STEP 3 — scrapeLeads ──────────────────────────────────────────────────────
 async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads = 25) {
     const liAt    = decrypt(encryptedCookie);
     const browser = await puppeteer.launch(getLaunchConfig());
-
-    // Single persistent page — eliminates the per-page frame-attach race condition
-    // that causes "Navigating frame was detached" on every new page open.
     let page;
 
     try {
         page = await makeScrapePage(browser, liAt);
 
-        // ── 1. Session verification ───────────────────────────────────────────
-        console.log('🔐 Verifying session...');
+        // ── 1. Verify session ─────────────────────────────────────────────────
+        console.log('🔐 Verifying LinkedIn session...');
         const feedOk = await safeGoto(page, 'https://www.linkedin.com/feed', { timeout: 90000 });
 
         if (!feedOk) {
-            // Frame died on /feed — LinkedIn may be doing a checkpoint redirect.
-            // Wait and reload once before giving up.
-            await randomDelay(4000, 6000);
+            // safeGoto already waited 3s after failure — try once more
+            console.warn('   ⚠️ Feed navigation failed — retrying after 8s...');
+            await randomDelay(8000, 10000);
             const retryOk = await safeGoto(page, 'https://www.linkedin.com/feed', { timeout: 60000 });
             if (!retryOk) {
                 await browser.close();
-                throw new Error('LinkedIn blocked navigation during session check. Please reconnect LinkedIn in Settings.');
+                throw new Error('LinkedIn blocked navigation. Please reconnect LinkedIn in Settings.');
             }
         }
 
-        const sessionLoggedIn = await isLoggedIn(page);
-        if (!sessionLoggedIn) {
+        // safeGoto already includes a 2-3s settle delay — safeUrl is now safe to call
+        const feedUrl = await safeUrl(page);
+        const loggedIn = feedUrl && !feedUrl.includes('/login') && !feedUrl.includes('/authwall') &&
+                         !feedUrl.includes('checkpoint') && !feedUrl.includes('/uas/');
+
+        if (!loggedIn) {
             await browser.close();
             throw new Error('LinkedIn session expired. Please reconnect LinkedIn in Settings.');
         }
         console.log('✅ Session valid — proceeding to search');
 
-        // ── 2. Collect profile URLs — max 3 search pages ────────────────────
+        // ── 2. Collect profile URLs — HARD CAP: 3 pages ──────────────────────
         console.log('🔍 Navigating to search URL...');
         const allProfileUrls = new Set();
-        // Hard cap: only scrape 3 search pages (30 results max) regardless of maxLeads.
-        // More pages = more LinkedIn redirects = more frame detach risk.
-        const MAX_SEARCH_PAGES = 3;
+        const MAX_SEARCH_PAGES = 3; // 30 results max — beyond this LinkedIn rate-limits aggressively
         let emptyStreak = 0;
 
         for (let pageNum = 0; pageNum < MAX_SEARCH_PAGES; pageNum++) {
             if (allProfileUrls.size >= maxLeads) break;
 
             const targetUrl = `${searchUrl}&start=${pageNum * 10}`;
-            console.log(`📄 Scraping search page ${pageNum + 1}: ${targetUrl}`);
+            console.log(`📄 Scraping search page ${pageNum + 1}/${MAX_SEARCH_PAGES}: ${targetUrl}`);
 
-            // safeGoto returns false instead of throwing on frame detach
+            // safeGoto handles the frame detach AND waits 2-3s for LinkedIn to settle
             const navOk = await safeGoto(page, targetUrl, { timeout: 60000 });
             if (!navOk) {
                 console.warn(`   ⚠️ Navigation failed on page ${pageNum + 1} — skipping`);
-                await randomDelay(5000, 8000);
+                await randomDelay(8000, 12000);
                 continue;
             }
 
-            // Let the page settle — don't call isLoggedIn here as it races
-            // against LinkedIn's lazy-load redirects on later pages.
-            // Instead just check the URL directly via safeEval.
-            await randomDelay(3000, 4000);
-
-            const currentUrl = await safeEval(page, () => window.location.href, '');
-            if (
-                currentUrl.includes('/authwall') ||
-                currentUrl.includes('/login') ||
-                currentUrl.includes('checkpoint') ||
-                currentUrl.includes('/uas/')
-            ) {
-                console.warn('⚠️ Session lost or checkpoint hit — stopping search');
+            // Auth wall check — safeUrl goes through safeEval, never throws
+            if (await isAuthWall(page)) {
+                console.warn('⚠️ Auth wall or session lost — stopping search');
                 break;
             }
 
-            // Scroll to trigger lazy-load
-            await safeEval(page, () => window.scrollBy(0, 700), null);
-            await randomDelay(1200, 1800);
-            await safeEval(page, () => window.scrollBy(0, 700), null);
-            await randomDelay(1200, 1800);
+            // Scroll to trigger lazy-load content
+            await safeEval(page, () => window.scrollBy(0, 800), null);
+            await randomDelay(2000, 3000);
+            await safeEval(page, () => window.scrollBy(0, 800), null);
+            await randomDelay(2000, 3000);
 
-            // Extract profile URLs — safeEval returns [] if frame dies
+            // Extract profile URLs
             const urls = await safeEval(page, () => {
                 const links = new Set();
                 document.querySelectorAll('a[href*="/in/"]').forEach(el => {
                     const href = el.href.split('?')[0].replace(/\/$/, '');
-                    if (
-                        href &&
-                        href.includes('linkedin.com/in/') &&
-                        !href.includes('/in/undefined') &&
-                        !href.endsWith('/in/')
-                    ) links.add(href);
+                    if (href && href.includes('linkedin.com/in/') &&
+                        !href.includes('/in/undefined') && !href.endsWith('/in/'))
+                        links.add(href);
                 });
                 return [...links];
             }, []);
@@ -656,18 +529,15 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
             console.log(`   Found ${urls.length} profiles on page ${pageNum + 1}`);
 
             if (urls.length === 0) {
-                if (++emptyStreak >= 2) {
-                    console.log('   No more results — stopping search');
-                    break;
-                }
+                if (++emptyStreak >= 2) { console.log('   No more results — stopping'); break; }
             } else {
                 emptyStreak = 0;
                 urls.forEach(u => allProfileUrls.add(u));
             }
 
-            // Gap between pages
-            if (pageNum < MAX_SEARCH_PAGES - 1) {
-                await randomDelay(4000, 6000);
+            // Human-like gap between pages (6-10 seconds)
+            if (pageNum < MAX_SEARCH_PAGES - 1 && allProfileUrls.size < maxLeads) {
+                await randomDelay(6000, 10000);
             }
         }
 
@@ -676,54 +546,43 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
 
         if (profileUrls.length === 0) {
             await browser.close();
-            throw new Error('No profiles found. Check your LinkedIn search URL and filters.');
+            throw new Error('No profiles found. Check your LinkedIn search URL.');
         }
 
-        // ── 3. Scrape each profile — reuse same page, no new page per profile ─
+        // ── 3. Scrape individual profiles ─────────────────────────────────────
         const leads = [];
 
         for (let i = 0; i < profileUrls.length; i++) {
             const profileUrl = profileUrls[i];
             console.log(`👤 ${i + 1}/${profileUrls.length}: ${profileUrl}`);
 
-            await randomDelay(4000, 8000);
+            // Human-like gap between profiles (8-15 seconds)
+            await randomDelay(8000, 15000);
 
-            const profOk = await safeGoto(page, profileUrl, { timeout: 45000 });
+            const profOk = await safeGoto(page, profileUrl, { timeout: 60000 });
             if (!profOk) {
-                console.warn(`   ⚠️ Could not navigate to profile ${i + 1} — skipping`);
+                console.warn(`   ⚠️ Could not load profile ${i + 1} — skipping`);
                 leads.push({ profileUrl, name: null, headline: null, location: null, company: null, about: null, profileImage: null });
                 continue;
             }
 
-            // Check for auth wall
-            const currentUrl = await safeEval(page, () => window.location.href, '');
-            if (
-                currentUrl.includes('/authwall') ||
-                currentUrl.includes('/login') ||
-                currentUrl.includes('checkpoint')
-            ) {
-                console.warn(`⚠️ Auth wall at profile ${i + 1} — stopping profile scrape`);
+            if (await isAuthWall(page)) {
+                console.warn(`⚠️ Auth wall at profile ${i + 1} — stopping`);
                 break;
             }
 
-            await randomDelay(7000, 11000);
+            // Read time — LinkedIn's heuristics look for time-on-page
+            await randomDelay(8000, 12000);
 
-            // Scroll naturally
-            for (const amt of [400, 500, 400, 500]) {
+            // Natural scroll pattern
+            for (const amt of [350, 450, 400, 500]) {
                 await safeEval(page, a => window.scrollBy(0, a), null, amt);
-                await randomDelay(1200, 2000);
+                await randomDelay(2000, 3500);
             }
             await safeEval(page, () => window.scrollTo(0, 0), null);
-            await randomDelay(1000, 2000);
+            await randomDelay(1500, 2500);
 
-            const profileData = await extractProfileData(page).catch(err => {
-                if (isFrameError(err)) {
-                    console.warn(`   ⚠️ Frame detached during profile extract ${i + 1}`);
-                    return { name: null, headline: null, location: null, company: null, about: null, profileImage: null };
-                }
-                throw err;
-            });
-
+            const profileData = await extractProfileData(page);
             console.log(`   ✅ ${profileData.name || '(no name)'} @ ${profileData.company || '(no company)'}`);
             leads.push({ profileUrl, ...profileData });
         }
@@ -756,7 +615,7 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
 
     } catch (err) {
         if (isFrameError(err)) {
-            console.error('❌ scrapeLeads: frame detached (LinkedIn checkpoint/redirect):', err.message.slice(0, 80));
+            console.error('❌ scrapeLeads frame error:', err.message.slice(0, 80));
             try { await browser.close(); } catch {}
             throw new Error('LinkedIn interrupted the scrape. Please try again in a few minutes.');
         }
@@ -765,6 +624,5 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         throw err;
     }
 }
-
 
 module.exports = { initiateLinkedInLogin, submitLinkedInOtp, scrapeLeads, decrypt };
