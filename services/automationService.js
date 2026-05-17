@@ -19,61 +19,6 @@ const { buildStickyProxyArgs, authenticatePage } = require('./Proxysession');
 
 puppeteer.use(StealthPlugin());
 
-// ── Frame-safety helpers ─────────────────────────────────────────────────────
-
-/**
- * safeGoto — navigates and retries once if the frame detaches mid-navigation.
- * LinkedIn sometimes triggers a checkpoint redirect that destroys the frame.
- */
-async function safeGoto(page, url, options = {}) {
-  const opts = { waitUntil: 'domcontentloaded', timeout: 60000, ...options };
-  try {
-    await page.goto(url, opts);
-  } catch (err) {
-    if (err.message.includes('detached Frame') || err.message.includes('Target closed')) {
-      console.warn('[safeGoto] Frame detached — waiting 2s and retrying once…');
-      await sleep(2000);
-      // page may have recovered on its own after a redirect
-      const current = page.url();
-      if (!current.includes(url.split('/').slice(-2).join('/'))) {
-        // Not on the right page yet — retry
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      }
-    } else {
-      throw err;
-    }
-  }
-  // Guard: if LinkedIn redirected us to a checkpoint / login, surface it clearly
-  const final = page.url();
-  if (
-    final.includes('/authwall') ||
-    final.includes('/checkpoint') ||
-    final.includes('/login')
-  ) {
-    throw new Error(`LinkedIn auth wall reached at ${final}`);
-  }
-}
-
-/**
- * safeEvaluate — wraps page.evaluate so a detached-frame error returns null
- * instead of crashing the whole campaign run.
- */
-async function safeEvaluate(page, fn, ...args) {
-  try {
-    return await page.evaluate(fn, ...args);
-  } catch (err) {
-    if (
-      err.message.includes('detached Frame') ||
-      err.message.includes('Execution context was destroyed') ||
-      err.message.includes('Target closed')
-    ) {
-      console.warn('[safeEvaluate] Frame detached during evaluate — skipping');
-      return null;
-    }
-    throw err;
-  }
-}
-
 // ── Constants ────────────────────────────────────────────────────────────────
 const DAILY_CONNECTION_LIMIT = 20;
 const WORKING_HOUR_START     = 9;   // 9 AM
@@ -255,24 +200,20 @@ async function actionViewProfile(page, profileUrl) {
   console.log('👁  Viewing profile:', profileUrl);
 
   try {
-    // Use safeGoto — retries once on detached-frame and surfaces auth walls
-    await safeGoto(page, profileUrl, { waitUntil: 'networkidle2', timeout: 60000 })
+    // Use networkidle2 so LinkedIn's analytics pixel fires — this is what
+    // actually registers the profile view in LinkedIn's system
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
       .catch(async (err) => {
-        if (err.message.includes('networkidle2') || err.message.includes('timeout')) {
-          console.log('   ⚠️  networkidle2 timed out — waiting for profile element');
-          await page.waitForSelector('h1', { timeout: 15000 }).catch(() => {});
-        } else {
-          throw err;
+        if (!err.message.includes('detached') && !err.message.includes('Target closed')) {
+          console.log('   ⚠️  navigation issue:', err.message.slice(0,60));
         }
+        await page.waitForSelector('h1', { timeout: 15000 }).catch(() => {});
       });
 
     // Verify we're actually on a profile page, not auth wall or 404
-    const currentUrl = page.url();
-    if (
-      currentUrl.includes('/authwall') ||
-      currentUrl.includes('/login')    ||
-      currentUrl.includes('checkpoint')
-    ) {
+    let currentUrl = '';
+    try { currentUrl = page.url(); } catch {}
+    if (currentUrl.includes('/authwall') || currentUrl.includes('/login') || currentUrl.includes('checkpoint')) {
       return { success: false, message: 'Auth wall hit' };
     }
 
@@ -307,7 +248,7 @@ async function actionViewProfile(page, profileUrl) {
     ];
 
     for (const step of scrollSteps) {
-      await safeEvaluate(page, amount => window.scrollBy({ top: amount, behavior: 'smooth' }), step.amount);
+      await page.evaluate(amount => window.scrollBy({ top: amount, behavior: 'smooth' }), step.amount).catch(() => {});
 
       // Random pause between scrolls (like a human reading each section)
       await sleep(gaussianDelay(1200, 400, 600, 3000));
@@ -327,7 +268,7 @@ async function actionViewProfile(page, profileUrl) {
 
     // Scroll back up slowly (real users often scroll back up)
     if (Math.random() < 0.6) {
-      await safeEvaluate(page, () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+      await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' })).catch(() => {});
       await sleep(gaussianDelay(1500, 400, 800, 3000));
     }
 
@@ -342,7 +283,7 @@ async function actionViewProfile(page, profileUrl) {
 
 async function actionFollow(page, profileUrl) {
   console.log('➕ Following:', profileUrl);
-  await safeGoto(page, profileUrl, { waitUntil: 'networkidle2', timeout: 60000 })
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
     .catch(() => page.waitForSelector('h1', { timeout: 15000 }).catch(() => {}));
   await sleep(readingDelay());
 
@@ -377,7 +318,7 @@ async function actionFollow(page, profileUrl) {
 
 async function actionConnect(page, profileUrl, note, lead) {
   console.log('🤝 Connecting with:', lead.name);
-  await safeGoto(page, profileUrl, { waitUntil: 'networkidle2', timeout: 60000 })
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
     .catch(() => page.waitForSelector('h1', { timeout: 15000 }).catch(() => {}));
   await sleep(readingDelay());
 
@@ -434,7 +375,7 @@ async function actionMessage(page, profileUrl, messageTemplate, lead) {
   console.log('💬 Messaging:', lead.name);
   const message = personalizeMessage(messageTemplate, lead);
 
-  await safeGoto(page, profileUrl, { waitUntil: 'networkidle2', timeout: 60000 })
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 })
     .catch(() => page.waitForSelector('h1', { timeout: 15000 }).catch(() => {}));
   await sleep(readingDelay());
 
@@ -472,7 +413,7 @@ async function actionInMail(page, profileUrl, subject, messageTemplate, lead) {
   console.log('📧 Sending InMail to:', lead.name);
   const message = personalizeMessage(messageTemplate, lead);
 
-  await safeGoto(page, profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(readingDelay());
 
   try {
@@ -514,16 +455,16 @@ async function actionInMail(page, profileUrl, subject, messageTemplate, lead) {
 
 async function actionEndorse(page, profileUrl) {
   console.log('⭐ Endorsing skills for:', profileUrl);
-  await safeGoto(page, profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(readingDelay());
 
   try {
     // Scroll to skills section
-    await safeEvaluate(page, () => {
+    await page.evaluate(() => {
       const skillsSection = document.querySelector('#skills') ||
                             document.querySelector('[data-section="skills"]');
       if (skillsSection) skillsSection.scrollIntoView({ behavior: 'smooth' });
-    });
+    }).catch(() => {});
     await sleep(gaussianDelay(2000, 500, 1000, 4000));
 
     // Click endorse buttons (up to 3)
@@ -549,10 +490,10 @@ async function checkForReplies(userId, liAt) {
     const page = await makePage(browser, liAt);
     await page.goto('https://www.linkedin.com/messaging/', {
       waitUntil: 'domcontentloaded', timeout: 60000
-    });
+    }).catch(err => console.warn('[checkForReplies] nav:', err.message.slice(0,60)));
     await sleep(readingDelay());
 
-    const threads = await safeEvaluate(page, () => {
+    const threads = await page.evaluate(() => {
       const items = [];
       document.querySelectorAll('.msg-conversation-listitem').forEach(el => {
         const nameEl    = el.querySelector('.msg-conversation-listitem__participant-names');
@@ -569,10 +510,12 @@ async function checkForReplies(userId, liAt) {
         }
       });
       return items.filter(i => i.hasUnread);
+    }).catch(err => {
+      console.warn('[checkForReplies] evaluate error:', err.message.slice(0, 60));
+      return [];
     });
 
-    // safeEvaluate returns null if the frame detached — treat as no unread threads
-    if (!threads) {
+    if (!threads || threads.length === 0) {
       await browser.close();
       return 0;
     }
