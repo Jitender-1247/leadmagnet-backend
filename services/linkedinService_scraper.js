@@ -514,235 +514,216 @@ async function makeScrapePage(browser, liAt) {
 }
 
 // ── STEP 3 — Scrape leads ─────────────────────────────────────────────────────
+// ── Universal frame-error detector ──────────────────────────────────────────
+function isFrameError(err) {
+    const msg = (err && err.message) ? err.message : String(err);
+    return (
+        msg.includes('detached Frame') ||
+        msg.includes('Navigating frame was detached') ||
+        msg.includes('Execution context was destroyed') ||
+        msg.includes('Target closed') ||
+        msg.includes('Session closed') ||
+        msg.includes('net::ERR_ABORTED') ||
+        msg.includes('Cannot find context') ||
+        msg.includes('Attempted to use detached')
+    );
+}
+
+// ── Safe goto — NEVER throws a frame error, returns true/false ───────────────
+// This is the single choke-point for all navigation. If LinkedIn destroys the
+// frame during navigation, we catch it here and return false so callers can
+// decide whether to retry or skip — without ever crashing.
+async function safeGoto(page, url, opts = {}) {
+    const options = { waitUntil: 'domcontentloaded', timeout: 60000, ...opts };
+    try {
+        await page.goto(url, options);
+        return true;
+    } catch (err) {
+        if (isFrameError(err)) {
+            console.warn(`   ⚠️ safeGoto: frame detached navigating to ${url.slice(0, 80)} — (${err.message.slice(0, 60)})`);
+            return false;
+        }
+        throw err; // real errors (network down, bad URL) still surface
+    }
+}
+
+// ── Safe evaluate — NEVER throws a frame error, returns fallback value ────────
+async function safeEval(page, fn, fallback = null, ...args) {
+    try {
+        return await page.evaluate(fn, ...args);
+    } catch (err) {
+        if (isFrameError(err)) {
+            console.warn(`   ⚠️ safeEval: frame detached during evaluate — returning fallback`);
+            return fallback;
+        }
+        throw err;
+    }
+}
+
+// ── STEP 3 — Scrape leads ─────────────────────────────────────────────────────
 async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads = 25) {
     const liAt    = decrypt(encryptedCookie);
     const browser = await puppeteer.launch(getLaunchConfig());
 
+    // Single persistent page — eliminates the per-page frame-attach race condition
+    // that causes "Navigating frame was detached" on every new page open.
+    let page;
+
     try {
-        // ── Session verification ─────────────────────────────────────────────
-        // We verify by navigating to /feed and checking the resulting URL.
-        // LinkedIn sometimes redirects /feed to a checkpoint/search page and
-        // destroys the frame mid-navigation — we catch that here so it never
-        // surfaces as an unhandled "detached Frame" crash.
+        page = await makeScrapePage(browser, liAt);
+
+        // ── 1. Session verification ───────────────────────────────────────────
         console.log('🔐 Verifying session...');
-        let sessionValid = false;
+        const feedOk = await safeGoto(page, 'https://www.linkedin.com/feed', { timeout: 90000 });
 
-        try {
-            const sessionPage = await makeScrapePage(browser, liAt);
-
-            await sessionPage.goto('https://www.linkedin.com/feed', {
-                waitUntil: 'domcontentloaded',
-                timeout: 90000,
-            }).catch(err => {
-                // Timeout or frame detach during navigation — isLoggedIn will
-                // check the URL (or return false if the frame is already dead)
-                console.warn('⚠️ Feed navigation issue:', err.message.slice(0, 80));
-            });
-
-            sessionValid = await isLoggedIn(sessionPage);
-
-            if (!sessionValid) {
-                // One retry — wait and reload
-                await randomDelay(3000, 5000);
-                await sessionPage.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
-                    .catch(() => {});
-                sessionValid = await isLoggedIn(sessionPage);
-            }
-
-            await sessionPage.close().catch(() => {});
-        } catch (err) {
-            // Catch any residual detached-frame error from the session check
-            if (
-                err.message.includes('detached Frame') ||
-                err.message.includes('Target closed') ||
-                err.message.includes('Session closed')
-            ) {
-                console.warn('⚠️ Session page frame detached — will attempt scrape anyway');
-                // sessionValid stays false → will throw below
-            } else {
-                throw err;
+        if (!feedOk) {
+            // Frame died on /feed — LinkedIn may be doing a checkpoint redirect.
+            // Wait and reload once before giving up.
+            await randomDelay(4000, 6000);
+            const retryOk = await safeGoto(page, 'https://www.linkedin.com/feed', { timeout: 60000 });
+            if (!retryOk) {
+                await browser.close();
+                throw new Error('LinkedIn blocked navigation during session check. Please reconnect LinkedIn in Settings.');
             }
         }
 
-        if (!sessionValid) {
+        const sessionLoggedIn = await isLoggedIn(page);
+        if (!sessionLoggedIn) {
             await browser.close();
-            throw new Error('LinkedIn session expired or blocked. Please reconnect LinkedIn in Settings.');
+            throw new Error('LinkedIn session expired. Please reconnect LinkedIn in Settings.');
         }
+        console.log('✅ Session valid — proceeding to search');
 
-        console.log('✅ Session valid');
-
-        // Collect profile URLs — one page per search result page
+        // ── 2. Collect profile URLs from search result pages ──────────────────
+        console.log('🔍 Navigating to search URL...');
         const allProfileUrls = new Set();
-        let pageNum = 0;
+        let pageNum   = 0;
         const maxPages = Math.ceil(maxLeads / 10) + 2;
-        let emptyCount = 0;
+        let emptyStreak = 0;
 
         while (allProfileUrls.size < maxLeads && pageNum < maxPages) {
-            const sp = await makeScrapePage(browser, liAt);
-            try {
-                // Catch ALL frame-detach variants from goto — LinkedIn destroys
-                // the frame mid-navigation on checkpoint redirects.
-                const gotoErr = await sp.goto(`${searchUrl}&start=${pageNum * 10}`, {
-                    waitUntil: 'domcontentloaded', timeout: 60000
-                }).then(() => null).catch(err => err);
+            const targetUrl = `${searchUrl}&start=${pageNum * 10}`;
+            console.log(`   Scraping search page ${pageNum + 1}: ${targetUrl}`);
 
-                if (gotoErr) {
-                    const msg = gotoErr.message || '';
-                    const isFrameError =
-                        msg.includes('detached Frame') ||
-                        msg.includes('Navigating frame was detached') ||
-                        msg.includes('Execution context was destroyed') ||
-                        msg.includes('Target closed') ||
-                        msg.includes('Session closed') ||
-                        msg.includes('net::ERR_ABORTED');
-                    if (isFrameError) {
-                        console.warn(`   ⚠️ Navigation aborted on search page ${pageNum + 1} (${msg.slice(0, 60)}) — skipping`);
-                        await sp.close().catch(() => {});
-                        pageNum++;
-                        await randomDelay(4000, 7000);
-                        continue;
-                    }
-                    throw gotoErr; // real error — bubble up
-                }
+            const navOk = await safeGoto(page, targetUrl, { timeout: 60000 });
 
-                await randomDelay(3000, 4000);
-
-                if (!await isLoggedIn(sp)) {
-                    console.warn('⚠️ Session rejected — stopping');
-                    await sp.close();
-                    break;
-                }
-
-                // Guard: if the page frame detached during navigation (LinkedIn
-                // redirect / checkpoint), treat this search page as empty and move on.
-                const isDetached = () => {
-                    try { sp.url(); return false; } catch { return true; }
-                };
-
-                if (isDetached()) {
-                    console.warn(`   ⚠️ Frame detached after navigation — skipping search page ${pageNum + 1}`);
-                    await sp.close().catch(() => {});
+            if (!navOk) {
+                // Frame detached during navigation — wait longer and retry once
+                console.warn(`   ⚠️ Navigation failed on search page ${pageNum + 1} — waiting 8s and retrying`);
+                await randomDelay(8000, 12000);
+                const retryOk = await safeGoto(page, targetUrl, { timeout: 60000 });
+                if (!retryOk) {
+                    console.warn(`   ⚠️ Retry also failed — skipping page ${pageNum + 1}`);
                     pageNum++;
-                    await randomDelay(3000, 5000);
                     continue;
                 }
+            }
 
-                // Safe scroll — each call individually guarded
-                await sp.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
-                if (!isDetached()) await randomDelay(1000, 1500);
-                await sp.evaluate(() => window.scrollBy(0, 600)).catch(() => {});
-                if (!isDetached()) await randomDelay(1000, 1500);
+            await randomDelay(3000, 4000);
 
-                // Safe URL extraction — returns [] if frame died mid-evaluate
-                const urls = await sp.evaluate(() => {
-                    const links = new Set();
-                    document.querySelectorAll('a[href*="/in/"]').forEach(el => {
-                        const href = el.href.split('?')[0].replace(/\/$/, '');
-                        if (href && href.includes('linkedin.com/in/') && !href.includes('/in/undefined') && !href.endsWith('/in/'))
-                            links.add(href);
-                    });
-                    return [...links];
-                }).catch(err => {
-                    // Detached frame during evaluate — not a crash, just no URLs this page
+            // Check session still valid after navigation
+            const stillLoggedIn = await isLoggedIn(page);
+            if (!stillLoggedIn) {
+                console.warn('⚠️ Session lost during scrape — stopping');
+                break;
+            }
+
+            // Scroll to load lazy content
+            await safeEval(page, () => window.scrollBy(0, 600), null);
+            await randomDelay(1000, 1500);
+            await safeEval(page, () => window.scrollBy(0, 600), null);
+            await randomDelay(1000, 1500);
+
+            // Extract profile URLs
+            const urls = await safeEval(page, () => {
+                const links = new Set();
+                document.querySelectorAll('a[href*="/in/"]').forEach(el => {
+                    const href = el.href.split('?')[0].replace(/\/$/, '');
                     if (
-                        err.message.includes('detached Frame') ||
-                        err.message.includes('Execution context was destroyed') ||
-                        err.message.includes('Target closed')
-                    ) {
-                        console.warn(`   ⚠️ Frame detached during URL extraction on page ${pageNum + 1} — skipping`);
-                        return [];
-                    }
-                    throw err; // Re-throw real errors
+                        href &&
+                        href.includes('linkedin.com/in/') &&
+                        !href.includes('/in/undefined') &&
+                        !href.endsWith('/in/')
+                    ) links.add(href);
                 });
+                return [...links];
+            }, []); // fallback = empty array if frame dies
 
-                console.log(`   Page ${pageNum + 1}: ${urls.length} profiles found`);
-                if (urls.length === 0) { await sp.close(); break; }
+            console.log(`   Page ${pageNum + 1}: ${urls.length} profiles found`);
 
+            if (urls.length === 0) {
+                if (++emptyStreak >= 2) break;
+            } else {
+                emptyStreak = 0;
                 const before = allProfileUrls.size;
                 urls.forEach(u => allProfileUrls.add(u));
-                if (allProfileUrls.size - before === 0) {
-                    if (++emptyCount >= 2) { await sp.close(); break; }
-                } else { emptyCount = 0; }
-
-            } catch (err) {
-                const msg = err.message || '';
-                const isFrameError =
-                    msg.includes('detached Frame') ||
-                    msg.includes('Navigating frame was detached') ||
-                    msg.includes('Execution context was destroyed') ||
-                    msg.includes('Target closed') ||
-                    msg.includes('Session closed');
-                if (isFrameError) {
-                    console.warn(`   ⚠️ Frame error on search page ${pageNum + 1} — skipping:`, msg.slice(0, 80));
-                } else {
-                    console.warn(`   Search page ${pageNum + 1} error:`, msg);
+                if (allProfileUrls.size === before) {
+                    if (++emptyStreak >= 2) break;
                 }
-            } finally {
-                try { await sp.close(); } catch {}
             }
+
             pageNum++;
             await randomDelay(3000, 5000);
         }
 
         const profileUrls = [...allProfileUrls].slice(0, maxLeads);
-        console.log(`📋 ${profileUrls.length} profiles to scrape`);
+        console.log(`📋 ${profileUrls.length} unique profiles to scrape`);
 
         if (profileUrls.length === 0) {
             await browser.close();
-            throw new Error('No profiles found. Check your LinkedIn search URL.');
+            throw new Error('No profiles found. Check your LinkedIn search URL and filters.');
         }
 
-        // Scrape each profile on its OWN fresh page — eliminates detached frame errors
+        // ── 3. Scrape each profile — reuse same page, no new page per profile ─
         const leads = [];
 
         for (let i = 0; i < profileUrls.length; i++) {
             const profileUrl = profileUrls[i];
             console.log(`👤 ${i + 1}/${profileUrls.length}: ${profileUrl}`);
 
-            const pp = await makeScrapePage(browser, liAt);
-            try {
-                await randomDelay(4000, 8000);
+            await randomDelay(4000, 8000);
 
-                await pp.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
-                    .catch(err => console.warn(`   ⚠️ goto: ${err.message}`));
-
-                const url = pp.url();
-                if (url.includes('/authwall') || url.includes('/login') || url.includes('checkpoint')) {
-                    console.warn(`⚠️ Auth wall at profile ${i + 1} — stopping`);
-                    await pp.close();
-                    break;
-                }
-
-                await randomDelay(7000, 11000);
-
-                for (const amt of [400, 500, 400, 500]) {
-                    await pp.evaluate(a => window.scrollBy(0, a), amt).catch(() => {});
-                    await randomDelay(1200, 2000);
-                }
-                await pp.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
-                await randomDelay(1000, 2000);
-
-                const profileData = await extractProfileData(pp).catch(err => {
-                    const isDetachError =
-                        err.message.includes('detached Frame') ||
-                        err.message.includes('Execution context was destroyed') ||
-                        err.message.includes('Target closed');
-                    console.warn(`   ⚠️ Extract error${isDetachError ? ' (frame detached)' : ''}:`, err.message.slice(0, 80));
-                    return { name: null, headline: null, location: null, company: null, about: null, profileImage: null };
-                });
-
-                console.log(`   ✅ ${profileData.name} @ ${profileData.company}`);
-                leads.push({ profileUrl, ...profileData });
-
-            } catch (err) {
-                console.warn(`⚠️ Profile ${i + 1} error:`, err.message);
+            const profOk = await safeGoto(page, profileUrl, { timeout: 45000 });
+            if (!profOk) {
+                console.warn(`   ⚠️ Could not navigate to profile ${i + 1} — skipping`);
                 leads.push({ profileUrl, name: null, headline: null, location: null, company: null, about: null, profileImage: null });
-            } finally {
-                try { await pp.close(); } catch {}
+                continue;
             }
+
+            // Check for auth wall
+            const currentUrl = await safeEval(page, () => window.location.href, '');
+            if (
+                currentUrl.includes('/authwall') ||
+                currentUrl.includes('/login') ||
+                currentUrl.includes('checkpoint')
+            ) {
+                console.warn(`⚠️ Auth wall at profile ${i + 1} — stopping profile scrape`);
+                break;
+            }
+
+            await randomDelay(7000, 11000);
+
+            // Scroll naturally
+            for (const amt of [400, 500, 400, 500]) {
+                await safeEval(page, a => window.scrollBy(0, a), null, amt);
+                await randomDelay(1200, 2000);
+            }
+            await safeEval(page, () => window.scrollTo(0, 0), null);
+            await randomDelay(1000, 2000);
+
+            const profileData = await extractProfileData(page).catch(err => {
+                if (isFrameError(err)) {
+                    console.warn(`   ⚠️ Frame detached during profile extract ${i + 1}`);
+                    return { name: null, headline: null, location: null, company: null, about: null, profileImage: null };
+                }
+                throw err;
+            });
+
+            console.log(`   ✅ ${profileData.name || '(no name)'} @ ${profileData.company || '(no company)'}`);
+            leads.push({ profileUrl, ...profileData });
         }
 
-        // Save to Firestore
+        // ── 4. Save to Firestore ──────────────────────────────────────────────
         if (leads.length > 0) {
             const batch = db.batch();
             leads.forEach(lead => {
@@ -762,29 +743,23 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 });
             });
             await batch.commit();
-            console.log(`💾 Saved ${leads.length} leads`);
+            console.log(`💾 Saved ${leads.length} leads to Firestore`);
         }
 
         await browser.close();
         return leads;
 
     } catch (err) {
-        // Translate low-level Puppeteer frame errors into actionable messages
-        if (
-            err.message.includes('detached Frame') ||
-            err.message.includes('Navigating frame was detached') ||
-            err.message.includes('Execution context was destroyed') ||
-            err.message.includes('Target closed') ||
-            err.message.includes('Session closed')
-        ) {
-            console.error('❌ scrapeLeads: browser frame detached (LinkedIn redirect/checkpoint):', err.message.slice(0, 80));
+        if (isFrameError(err)) {
+            console.error('❌ scrapeLeads: frame detached (LinkedIn checkpoint/redirect):', err.message.slice(0, 80));
             try { await browser.close(); } catch {}
-            throw new Error('LinkedIn interrupted the scrape (checkpoint or redirect). Please try again in a few minutes.');
+            throw new Error('LinkedIn interrupted the scrape. Please try again in a few minutes.');
         }
         console.error('❌ scrapeLeads error:', err.message);
         try { await browser.close(); } catch {}
         throw err;
     }
 }
+
 
 module.exports = { initiateLinkedInLogin, submitLinkedInOtp, scrapeLeads, decrypt };
