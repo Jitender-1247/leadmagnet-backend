@@ -12,11 +12,26 @@ var scheduler = require('./services/Scheduler');
 var app = express();
 app.set('trust proxy', 1);
 
+const allowedOrigins = [
+  'https://cloudflare-workers-autoconfig-leadmagnet.jitenderkumar1208733.workers.dev'
+];
 // Middleware
 app.use(logger('dev'));
 app.use(cors({
-     origin: 'https://cloudflare-workers-autoconfig-leadmagnet.jitenderkumar1208733.workers.dev/',
-   }));
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true // Allow cookies or auth headers if needed
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
