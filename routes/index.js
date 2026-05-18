@@ -3,7 +3,7 @@ var express = require('express');
 var app = express.Router();
 
 /* GET home page. */
-app.get('/', function(req, res, next) {
+app.get('/api/v1/', function(req, res, next) {
   res.send('Welcome to the LinkedIn Outreach Automation API');
 });
 
