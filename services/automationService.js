@@ -323,25 +323,85 @@ async function actionConnect(page, profileUrl, note, lead) {
   await sleep(readingDelay());
 
   try {
-    // Find Connect button (may be inside "More" dropdown)
-    let connectBtn = await page.$('button[aria-label*="Connect"]');
+    // Log current URL to detect auth walls
+    let currentUrl = '';
+    try { currentUrl = page.url(); } catch {}
+    if (currentUrl.includes('/authwall') || currentUrl.includes('/login')) {
+      return { success: false, message: 'Auth wall — session expired' };
+    }
 
+    // ── Find Connect button ───────────────────────────────────────────────────
+    // LinkedIn renders it differently depending on connection degree and screen size
+    let connectBtn = null;
+
+    // Try direct connect button first
+    const directSelectors = [
+      'button[aria-label*="Connect"]',
+      'button[aria-label*="connect"]',
+    ];
+    for (const sel of directSelectors) {
+      connectBtn = await page.$(sel);
+      if (connectBtn) { console.log(`   Found connect btn: ${sel}`); break; }
+    }
+
+    // Try inside "More actions" dropdown
     if (!connectBtn) {
-      const moreBtn = await page.$('button[aria-label*="More actions"]');
+      const moreBtn = await page.$('button[aria-label*="More actions"]') ||
+                      await page.$('button[aria-label*="more actions"]');
       if (moreBtn) {
         await moreBtn.click();
         await sleep(clickDelay());
-        const btns = await page.$x('//span[contains(text(), "Connect")]');
-        if (btns.length > 0) connectBtn = btns[0];
+
+        // Try multiple ways to find Connect in the dropdown
+        const dropdownSelectors = [
+          'div[aria-label*="Connect"]',
+          'span[aria-label*="Connect"]',
+          'li span::-p-text(Connect)',
+        ];
+        for (const sel of dropdownSelectors) {
+          try {
+            connectBtn = await page.$(sel);
+            if (connectBtn) { console.log(`   Found connect in dropdown: ${sel}`); break; }
+          } catch {}
+        }
+
+        // XPath fallback
+        if (!connectBtn) {
+          const xpathResults = await page.$x('//span[text()="Connect"]');
+          if (xpathResults.length > 0) {
+            connectBtn = xpathResults[0];
+            console.log('   Found connect via XPath');
+          }
+        }
       }
     }
 
-    if (!connectBtn) return { success: false, message: 'Connect button not found' };
+    if (!connectBtn) {
+      // Take a screenshot-equivalent — log visible buttons for debugging
+      const btns = await page.$$eval('button', els =>
+        els.map(e => e.getAttribute('aria-label') || e.innerText).filter(Boolean).slice(0, 10)
+      ).catch(() => []);
+      console.warn('   ⚠️ Connect button not found. Visible buttons:', btns.join(' | '));
+      return { success: false, message: 'Connect button not found' };
+    }
 
     await connectBtn.click();
     await sleep(clickDelay());
 
-    // Add a note?
+    // ── Handle the connect modal ──────────────────────────────────────────────
+    // LinkedIn shows a modal: "How do you know X?" or direct send
+    await sleep(1500); // wait for modal to appear
+
+    // Check for "How do you know" modal — click "Other" to bypass
+    const howKnowBtn = await page.$('button[aria-label*="Other"]') ||
+                       await page.$('button[data-view-name*="connect-other"]');
+    if (howKnowBtn) {
+      await howKnowBtn.click();
+      await sleep(clickDelay());
+      console.log('   Bypassed "How do you know" modal');
+    }
+
+    // Add note if provided
     if (note) {
       const addNoteBtn = await page.$('button[aria-label*="Add a note"]');
       if (addNoteBtn) {
@@ -356,17 +416,47 @@ async function actionConnect(page, profileUrl, note, lead) {
       }
     }
 
-    // Send
-    const sendBtn = await page.$('button[aria-label*="Send now"]') ||
-                    await page.$('button[aria-label*="Send invitation"]');
-    if (sendBtn) {
-      await sendBtn.click();
-      console.log('✅ Connection request sent');
+    // ── Find and click Send button ────────────────────────────────────────────
+    const sendSelectors = [
+      'button[aria-label*="Send now"]',
+      'button[aria-label*="Send invitation"]',
+      'button[aria-label*="Send without a note"]',
+      'button[aria-label*="Connect"]',   // sometimes the modal button says Connect
+    ];
+
+    let sendBtn = null;
+    for (const sel of sendSelectors) {
+      sendBtn = await page.$(sel);
+      if (sendBtn) { console.log(`   Found send btn: ${sel}`); break; }
+    }
+
+    if (!sendBtn) {
+      const modalBtns = await page.$$eval('button', els =>
+        els.map(e => e.getAttribute('aria-label') || e.innerText).filter(Boolean)
+      ).catch(() => []);
+      console.warn('   ⚠️ Send button not found. Modal buttons:', modalBtns.join(' | '));
+      return { success: false, message: 'Send button not found' };
+    }
+
+    await sendBtn.click();
+    await sleep(clickDelay());
+
+    // ── Verify the request actually went through ──────────────────────────────
+    // After sending, the Connect button should change to "Pending" or disappear
+    await sleep(2000);
+    const pendingBtn = await page.$('button[aria-label*="Pending"]') ||
+                       await page.$('button[aria-label*="Message"]');
+    if (pendingBtn) {
+      console.log('✅ Connection request confirmed — button changed to Pending/Message');
       return { success: true };
     }
 
-    return { success: false, message: 'Send button not found' };
+    // If no pending button found, still count as success (LinkedIn UI varies)
+    console.log('✅ Connection request sent (unconfirmed — button state unclear)');
+    return { success: true };
+
   } catch (err) {
+    console.error('   ❌ actionConnect error:', err.message);
     return { success: false, message: err.message };
   }
 }
@@ -686,6 +776,9 @@ async function runCampaign(campaignId) {
             nextActionAt: getNextActionAt(sequence, 1),
           });
           actionsCount++;
+          console.log(`[campaign] ✅ ${firstStep.type} succeeded for ${lead.name} — total: ${actionsCount}`);
+        } else {
+          console.warn(`[campaign] ⚠️ ${firstStep.type} failed for ${lead.name}: ${result.message || 'unknown reason'}`);
         }
 
         // Human-like delay between actions (2–8 minutes)

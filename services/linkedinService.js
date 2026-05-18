@@ -122,12 +122,10 @@ async function safeGoto(page, url, opts = {}) {
         await randomDelay(2000, 3000);
         return true;
     } catch (err) {
-        if (isFrameError(err) || err.message.includes('timeout') || err.message.includes('net::ERR')) {
-            console.warn(`   ⚠️ safeGoto: navigation failed — ${url.slice(0, 70)}`);
-            await new Promise(r => setTimeout(r, 3000));
-            return false;
-        }
-        throw err;
+        // Log the FULL error message so we know exactly what's failing
+        console.warn(`   ⚠️ safeGoto error [${err.message}] on: ${url.slice(0, 80)}`);
+        await new Promise(r => setTimeout(r, 3000));
+        return false;
     }
 }
 
@@ -614,20 +612,41 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         // ── Step 3: collect profile URLs from search page(s) ─────────────────
         console.log('🔍 Navigating to search URL...');
 
+        // Strip any existing pagination params — scraper adds its own &start=N
+        const cleanSearchUrl = searchUrl
+            .replace(/[&?]start=\d+/g, '')
+            .replace(/[&?]page=\d+/g, '')
+            .replace(/[&?]position=\d+/g, '')
+            .replace(/&&+/g, '&')
+            .replace(/\?&/, '?')
+            .replace(/&$/, '');
+        console.log(`🔗 Search URL: ${cleanSearchUrl.slice(0, 120)}`);
+
         const allProfileUrls = new Set();
         let pageNum = 0;
 
         const MAX_SEARCH_PAGES = 3;
         while (allProfileUrls.size < maxLeads && pageNum < MAX_SEARCH_PAGES) {
-            const paginatedUrl = `${searchUrl}&start=${pageNum * 10}`;
+            const paginatedUrl = `${cleanSearchUrl}&start=${pageNum * 10}`;
             console.log(`📄 Scraping search page ${pageNum + 1}: ${paginatedUrl}`);
 
             const navOk = await safeGoto(page, paginatedUrl, { timeout: 60000 });
+
+            // Log where we actually landed — critical for diagnosing blocks
+            const landedUrl = await safeEval(page, () => window.location.href, '');
+            console.log(`   📍 Landed: ${(landedUrl || 'unknown').slice(0, 100)}`);
+
             if (!navOk) {
                 console.warn(`   ⚠️ Navigation failed on page ${pageNum + 1} — skipping`);
                 await randomDelay(6000, 10000);
                 pageNum++;
                 continue;
+            }
+
+            // Detect auth wall even when navOk is true (LinkedIn redirects silently)
+            if (landedUrl && (landedUrl.includes('/authwall') || landedUrl.includes('/login') || landedUrl.includes('checkpoint'))) {
+                console.error('   ❌ Redirected to auth wall — session expired or IP blocked');
+                break;
             }
 
             await safeEval(page, () => window.scrollBy(0, 600), null);
