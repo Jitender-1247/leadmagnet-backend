@@ -14,7 +14,9 @@ app.set('trust proxy', 1);
 
 // Middleware
 app.use(logger('dev'));
-app.use(cors());
+app.use(cors({
+     origin: 'https://cloudflare-workers-autoconfig-leadmagnet.jitenderkumar1208733.workers.dev/',
+   }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
