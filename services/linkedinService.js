@@ -435,100 +435,170 @@ async function submitLinkedInOtp(uid, otp) {
     }
 }
 
-// ── Helper: extract profile data with multiple selector fallbacks ───────────
+// ── Helper: extract profile data ─────────────────────────────────────────────
+// Tries every known LinkedIn HTML structure across all versions (2020–2025).
+// LinkedIn changes its DOM frequently — we cascade through all known patterns
+// and fall back to raw text parsing if CSS selectors all fail.
 async function extractProfileData(page) {
+    // Extra wait — let lazy-loaded sections (experience, about) fully render
+    await randomDelay(3000, 4000);
+
     return await safeEval(page, () => {
 
-        const bodyLines = document.body.innerText
-            .split('\n')
-            .map(l => l.trim())
-            .filter(l => l.length > 0);
-
-        // ── Find "For Business" line — name always comes right after ────────
-        const forBusinessIdx = bodyLines.lastIndexOf('For Business');
-
-        let name = null, headline = null, location = null;
-
-        if (forBusinessIdx !== -1) {
-            // Skip any empty/garbage lines after "For Business"
-            const skipWords = ['Try Premium', 'Join now', 'Sign in', 'Advertisement'];
-            
-            let nameIdx = forBusinessIdx + 1;
-            // Skip ad/promo lines
-            while (
-                nameIdx < bodyLines.length &&
-                skipWords.some(w => bodyLines[nameIdx].includes(w))
-            ) {
-                nameIdx++;
+        // ── Utility: try a list of selectors, return first non-empty match ────
+        function pick(selectors, attr) {
+            for (const sel of selectors) {
+                try {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const val = attr === 'src' ? el.src
+                                  : attr === 'alt' ? el.alt
+                                  : (el.innerText || el.textContent || '').trim();
+                        if (val && val.length > 1 && val.length < 300
+                            && !val.includes('linkedin.com/in/')) {
+                            return val.replace(/\n+/g, ' ').trim();
+                        }
+                    }
+                } catch {}
             }
+            return null;
+        }
 
-            name     = bodyLines[nameIdx]     || null;
-            headline = bodyLines[nameIdx + 1] || null;
+        // ── NAME ─────────────────────────────────────────────────────────────
+        const name = pick([
+            'h1.text-heading-xlarge',                          // 2024-2025
+            'h1.inline.t-24.v-align-middle.break-words',       // 2023
+            '.pv-top-card--list h1',                           // 2023
+            '.ph5 h1',                                         // 2023
+            '.pv-top-card h1',                                 // 2022
+            '.artdeco-card h1',                                // 2022
+            'h1[class*="text-heading"]',                       // generic
+            'h1[class*="name"]',                               // generic
+            'main h1',                                         // last resort
+        ]);
 
-            // Location comes after "Message" button which follows the name repeat
-            // Structure: Name, Headline, Message, Name(repeat), Headline(repeat), Location
-            const messageIdx = bodyLines.findIndex(
-                (l, i) => i > nameIdx && (l === 'Message' || l === 'Connect' || l === 'Pending')
-            );
+        // ── HEADLINE ─────────────────────────────────────────────────────────
+        const headline = pick([
+            '.text-body-medium.break-words',                   // 2024-2025
+            '.pv-top-card--list .text-body-medium',            // 2023
+            '.ph5 .text-body-medium',                          // 2023
+            '.pv-top-card .text-body-medium',                  // 2022
+            '.mt2 .text-body-medium',                          // 2022
+            'h2.text-body-medium',                             // generic
+            '[class*="headline"]',                             // generic
+            '.pv-top-card h2',                                 // 2021
+        ]);
 
-            if (messageIdx !== -1) {
-                // After "Message": skip repeated name + headline, grab location
-                // location is usually 2-3 lines after Message
-                const candidateLines = bodyLines.slice(messageIdx + 1, messageIdx + 6);
-                
-                // Location looks like "City, State" or "City, Country"
-                // Skip lines that match name or headline (repeated)
-                location = candidateLines.find(l =>
-                    l !== name &&
-                    l !== headline &&
-                    l.length > 2 &&
-                    !l.includes('Try Premium') &&
-                    !l.includes('Connect') &&
-                    !l.includes('Message') &&
-                    !l.includes('Follow') &&
-                    !l.includes('She/') &&   // skip pronouns
-                    !l.includes('He/') &&
-                    !l.includes('They/') &&
-                    (l.includes(',') || l.includes('Area') || l.length < 40)
-                ) || null;
+        // ── LOCATION ─────────────────────────────────────────────────────────
+        const location = pick([
+            '.pb2 span.text-body-small.inline.t-black--light',     // 2024-2025
+            '.pv-top-card--list-bullet .text-body-small',           // 2023
+            '.ph5 span.text-body-small:not(.visually-hidden)',      // 2023
+            '.pv-top-card .pv-top-card--list-bullet span',          // 2022
+            'span.text-body-small[aria-label*="location"]',         // aria
+            '[class*="location"]',                                   // generic
+        ]);
+
+        // ── COMPANY ───────────────────────────────────────────────────────────
+        const company = pick([
+            // Top-card summary (most reliable — shows current company)
+            '.pv-text-details__right-panel .hoverable-link-text span[aria-hidden="true"]',
+            '.pv-text-details__right-panel span[aria-hidden="true"]',
+            // 2023
+            '.pv-top-card--experience-list span[aria-hidden="true"]',
+            // Experience section — first entry
+            '#experience ~ div .pvs-entity:first-child .hoverable-link-text span[aria-hidden="true"]',
+            '#experience ~ div .pvs-entity:first-child span[aria-hidden="true"]',
+            '#experience + div .pvs-entity span[aria-hidden="true"]',
+            '#experience ~ div li:first-child span[aria-hidden="true"]',
+            // 2022
+            '.experience-section li:first-child .pv-entity__secondary-title',
+            '.pv-top-card--experience-list-item span',
+            // Generic
+            '.pv-entity__secondary-title',
+            '[data-field="experience_company_logo"] + div span',
+        ]);
+
+        // ── ABOUT ─────────────────────────────────────────────────────────────
+        const about = pick([
+            '#about ~ div .inline-show-more-text span[aria-hidden="true"]',   // 2024
+            '#about ~ div .visually-hidden ~ span',                            // 2024
+            '#about ~ div span[aria-hidden="true"]',                           // 2023
+            '#about + div span[aria-hidden="true"]',                           // 2022
+            '#about ~ div .pv-shared-text-with-see-more span',                 // 2022
+            '.pv-about-section .pv-about__summary-text',                       // 2021
+            '.summary .pv-about__summary-text',                                // 2021
+            '[data-section="summary"] p',                                       // generic
+            '#about ~ div span',                                                // fallback
+        ]);
+
+        // ── PROFILE IMAGE ─────────────────────────────────────────────────────
+        const profileImage = pick([
+            'img.pv-top-card-profile-picture__image--show',    // 2024-2025
+            'img.profile-photo-edit__preview',                 // 2023
+            '.pv-top-card__photo img',                         // 2022
+            '.pv-top-card-profile-picture img',                // 2022
+            'img.EntityPhoto-circle-5',                        // 2022
+            'img[class*="EntityPhoto"]',                       // generic
+            'img.evi-image',                                   // 2021
+            '.presence-entity__image',                         // 2021
+            'section.artdeco-card img[width="200"]',           // size-based
+            'section.artdeco-card img[height="200"]',          // size-based
+            'img[width="200"][height="200"]',                  // exact size
+        ], 'src');
+
+        // ── FALLBACK: raw text parsing if all selectors failed ────────────────
+        // LinkedIn's text always follows a predictable structure we can parse.
+        let nameFb = null, headlineFb = null, locationFb = null;
+
+        if (!name || !headline) {
+            const lines = (document.body.innerText || '')
+                .split('\n')
+                .map(l => l.trim())
+                .filter(l => l.length > 1 && l.length < 120);
+
+            const noise = [
+                'Try Premium', 'Join now', 'Sign in', 'Advertisement',
+                'Message', 'Connect', 'Follow', 'More', 'Pending', 'LinkedIn',
+                'She/her', 'He/him', 'They/them', 'View profile',
+                '1st', '2nd', '3rd', 'degree', 'Open to', 'Hiring',
+            ];
+            const isClean = (l) => l.length > 2 && !noise.some(n => l.includes(n));
+
+            // Name is always right after "For Business" in LinkedIn's text output
+            const fbIdx = lines.lastIndexOf('For Business');
+            if (fbIdx !== -1) {
+                let i = fbIdx + 1;
+                while (i < lines.length && !isClean(lines[i])) i++;
+                nameFb     = lines[i]     || null;
+                headlineFb = lines[i + 1] || null;
+
+                // Location: comma-separated string after action buttons
+                const actionIdx = lines.findIndex(
+                    (l, idx) => idx > i && ['Message', 'Connect', 'Pending'].includes(l)
+                );
+                if (actionIdx !== -1) {
+                    for (let j = actionIdx + 1; j < Math.min(actionIdx + 8, lines.length); j++) {
+                        const l = lines[j];
+                        if (isClean(l) && l !== nameFb && l !== headlineFb &&
+                            (l.includes(',') || l.includes('Area') || l.length < 35)) {
+                            locationFb = l;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
-        // ── Company from experience section ──────────────────────────────────
-        const getText = (selectors) => {
-            for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el && el.innerText.trim()) return el.innerText.trim();
-            }
-            return null;
+        return {
+            name:         name         || nameFb      || null,
+            headline:     headline     || headlineFb  || null,
+            location:     location     || locationFb  || null,
+            company:      company      || null,
+            about:        about        || null,
+            profileImage: profileImage || null,
         };
 
-        const company = getText([
-            '.pv-text-details__right-panel .hoverable-link-text span[aria-hidden="true"]',
-            '#experience ~ div .pvs-entity span[aria-hidden="true"]',
-        ]);
-
-        const about = getText([
-            '#about ~ div span[aria-hidden="true"]',
-            '#about ~ div span',
-        ]);
-
-                // ✅ More robust profile image selectors
-        const imgEl = document.querySelector([
-            'img.pv-top-card-profile-picture__image--show',
-            'img.profile-photo-edit__preview',
-            'img.evi-image',
-            '.pv-top-card__photo img',
-            'img[class*="profile-picture"]',
-            'img[class*="EntityPhoto"]',
-            '.presence-entity__image',
-            'section img[height="200"]',
-            'section img[width="200"]',
-        ].join(', '));
-
-        const profileImage = imgEl?.src || null;
-
-        return { name, headline, location, company, about, profileImage };
     }, { name: null, headline: null, location: null, company: null, about: null, profileImage: null });
 }
 
@@ -722,7 +792,8 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 await profilePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 await profilePage.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-                // Set the li_at cookie on the new page
+                // Must visit LinkedIn domain first before cookie takes effect
+                await safeGoto(profilePage, 'https://www.linkedin.com', { timeout: 30000 });
                 await profilePage.setCookie({
                     name: 'li_at', value: liAt,
                     domain: '.linkedin.com', path: '/',
@@ -730,7 +801,7 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 });
 
                 // Navigate to profile
-                const profOk = await safeGoto(profilePage, profileUrl, { timeout: 45000 });
+                const profOk = await safeGoto(profilePage, profileUrl, { timeout: 60000 });
                 if (!profOk) {
                     console.warn(`   ⚠️ Could not load profile ${i + 1} — skipping`);
                     leads.push({ profileUrl, name: null, headline: null, location: null, company: null, about: null, profileImage: null });
@@ -766,7 +837,13 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
 
                 // Extract data
                 const profileData = await extractProfileData(profilePage);
-                console.log(`   ✅ Extracted:`, JSON.stringify(profileData));
+                console.log(`   ✅ Extracted: name=${profileData.name} company=${profileData.company} headline=${profileData.headline?.slice(0,40)}`);
+                if (!profileData.name) {
+                    // Log page title to help debug extraction failures
+                    const title = await safeEval(profilePage, () => document.title, '');
+                    const url   = await safeUrl(profilePage);
+                    console.warn(`   ⚠️ No name extracted. Title: "${title}" URL: ${url.slice(0,80)}`);
+                }
                 leads.push({ profileUrl, ...profileData });
 
             } catch (err) {
