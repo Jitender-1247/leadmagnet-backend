@@ -15,25 +15,34 @@ app.set('trust proxy', 1);
 const allowedOrigins = [
   'https://cloudflare-workers-autoconfig-leadmagnet.jitenderkumar1208733.workers.dev'
 ];
-// Middleware
-app.use(logger('dev'));
-app.use(cors({
+// 1. Define CORS options with a custom origin function
+const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
+    // Allow local development or tool testing (like Postman) where origin is undefined
     if (!origin) return callback(null, true);
     
+    // Check if the exact frontend domain is in our list
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      callback(new Error(`CORS blocked for origin: ${origin}`));
     }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true // Allow cookies or auth headers if needed
-}));
+  credentials: true,
+  optionsSuccessStatus: 200 // Explicitly forces older browsers/proxies to accept a 200 on preflight
+};
+
+// 2. Apply CORS to all routes
+app.use(cors(corsOptions));
+
+// 3. EXPLICITLY handle preflight (OPTIONS) requests globally
+app.options('*', cors(corsOptions));
+// 4. Continue with other middleware and routes
+app.use(logger('dev'));
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
