@@ -272,13 +272,27 @@ async function initiateLinkedInLogin(uid, email, password) {
             } catch { continue; }
         }
 
-        await page.waitForFunction(
-            () => !window.location.href.includes('/login'),
-            { timeout: 30000 }
-        );
+        // Wait for page to leave /login — but don't crash if it doesn't.
+        // LinkedIn may show a CAPTCHA or security check that keeps it on /login.
+        // We poll the URL manually instead of using waitForFunction.
+        let currentUrl = '';
+        for (let attempt = 0; attempt < 15; attempt++) {
+            await randomDelay(2000, 3000);
+            currentUrl = await safeEval(page, () => window.location.href, '') || '';
+            console.log(`📍 Login poll ${attempt + 1}: ${currentUrl.slice(0, 80)}`);
+            if (!currentUrl.includes('/login')) break;
 
-        await randomDelay(2000, 3000);
-        const currentUrl = await safeEval(page, () => window.location.href, '') || '';
+            // If still on login after 5 polls, try clicking submit again
+            if (attempt === 4) {
+                console.warn('   ⚠️ Still on login — retrying submit click');
+                for (const sel of ['[type=submit]', 'button.btn__primary--large']) {
+                    try {
+                        const btn = await page.$(sel);
+                        if (btn) { await btn.click(); break; }
+                    } catch {}
+                }
+            }
+        }
         console.log('📍 After login URL:', currentUrl);
 
         // ✅ Already logged in — no OTP needed
