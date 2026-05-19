@@ -647,7 +647,7 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
     const browser = await puppeteer.launch(getLaunchConfig());
 
     try {
-        const page = await browser.newPage();
+        let page = await browser.newPage();
 
         // ── Default timeouts ─────────────────────────────────────────────────
         page.setDefaultNavigationTimeout(60000);
@@ -766,34 +766,61 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
             // the entire DOM — any evaluate during this window gets a frame error.
             // We wait for a search-results-specific element to appear, proving
             // React has finished mounting and the frame is stable.
+            // Wait for the page to stabilise after React hydration.
+            // We try multiple selector strategies covering all LinkedIn layouts.
+            // If none match after timeout, we still proceed — the URL extract
+            // may still work since profile links are injected early.
             let pageReady = false;
-            for (let attempt = 0; attempt < 10; attempt++) {
-                try {
-                    // Wait for search results container or any profile link
-                    await page.waitForSelector(
-                        '.search-results-container, .reusable-search__result-container, a[href*="/in/"]',
-                        { timeout: 4000 }
-                    );
-                    pageReady = true;
-                    console.log(`   ✅ Page ready after ${attempt + 1} attempts`);
-                    break;
-                } catch {
-                    // Element not found yet — check if we're on the right URL
-                    let currentUrl = '';
-                    try { currentUrl = page.url(); } catch {}
-                    console.log(`   ⏳ Waiting for page mount (attempt ${attempt + 1}) — ${currentUrl.slice(0, 60)}`);
+            const readySelectors = [
+                // 2024-2025 layouts
+                'div[data-view-name="search-entity-result-universal-template"]',
+                '.search-results-container',
+                '.reusable-search__result-container',
+                // Profile links — present in all versions
+                'a[href*="linkedin.com/in/"]',
+                'a[href*="/in/"][class*="app-aware"]',
+                // Any result list
+                'ul.reusable-search__entity-result-list',
+                'div.entity-result',
+                'li.reusable-search__result-container',
+                // Fallback — main content loaded at all
+                'main',
+                'div[role="main"]',
+            ];
 
-                    if (currentUrl.includes('chrome-error') || currentUrl.includes('about:blank')) {
-                        console.warn(`   ⚠️ Chrome error page — skipping`);
-                        break;
-                    }
-                    if (currentUrl.includes('/authwall') || currentUrl.includes('/login')) {
-                        console.error('   ❌ Auth wall — stopping');
-                        pageReady = false;
-                        break;
-                    }
-                    await randomDelay(2000, 3000);
+            for (let attempt = 0; attempt < 8; attempt++) {
+                let currentUrl = '';
+                try { currentUrl = page.url(); } catch {}
+
+                if (currentUrl.includes('chrome-error') || currentUrl === 'about:blank') {
+                    console.warn('   ⚠️ Chrome error page — skipping');
+                    break;
                 }
+                if (currentUrl.includes('/authwall') || currentUrl.includes('/login') || currentUrl.includes('checkpoint')) {
+                    console.error('   ❌ Auth wall — stopping');
+                    break;
+                }
+
+                // Try each selector
+                for (const sel of readySelectors) {
+                    try {
+                        await page.waitForSelector(sel, { timeout: 3000 });
+                        pageReady = true;
+                        console.log(`   ✅ Page ready (selector: "${sel}")`);
+                        break;
+                    } catch {}
+                }
+
+                if (pageReady) break;
+                console.log(`   ⏳ Waiting for page mount (attempt ${attempt + 1}) — ${currentUrl.slice(0, 60)}`);
+                await randomDelay(2000, 3000);
+            }
+
+            // Even if no selector matched, still try extraction —
+            // profile links may be in the DOM under a different structure
+            if (!pageReady) {
+                console.warn('   ⚠️ No known selector matched — attempting extraction anyway');
+                pageReady = true; // allow extraction attempt
             }
 
             // Get final URL
@@ -806,9 +833,12 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 break;
             }
 
-            if (!pageReady || landedUrl.includes('chrome-error') || landedUrl === 'about:blank') {
-                console.warn(`   ⚠️ Page not ready on page ${pageNum + 1} — skipping`);
-                await randomDelay(5000, 8000);
+            if (landedUrl.includes('chrome-error') || landedUrl === 'about:blank') {
+                // If the frame is dead, recreate the page entirely
+                console.warn(`   ⚠️ Dead frame on page ${pageNum + 1} — recreating page`);
+                try { await page.close().catch(() => {}); } catch {}
+                page = await makeScrapePage(browser, liAt);
+                await randomDelay(3000, 5000);
                 pageNum++;
                 continue;
             }
