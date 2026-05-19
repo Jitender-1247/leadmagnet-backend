@@ -118,12 +118,36 @@ async function safeGoto(page, url, opts = {}) {
     const options = { waitUntil: 'domcontentloaded', timeout: 60000, ...opts };
     try {
         await page.goto(url, options);
-        // Settle delay — let LinkedIn's redirect scripts fire before we touch the page
         await randomDelay(2000, 3000);
         return true;
     } catch (err) {
-        // Log the FULL error message so we know exactly what's failing
-        console.warn(`   ⚠️ safeGoto error [${err.message}] on: ${url.slice(0, 80)}`);
+        const msg = err.message || '';
+
+        // ERR_TOO_MANY_REDIRECTS = cookie conflict — clear ALL cookies and retry once
+        if (msg.includes('ERR_TOO_MANY_REDIRECTS')) {
+            console.warn(`   ⚠️ Redirect loop detected — clearing cookies and retrying`);
+            try {
+                const cookies = await page.cookies();
+                for (const c of cookies) {
+                    await page.deleteCookie({ name: c.name, domain: c.domain }).catch(() => {});
+                }
+                // Re-set only li_at — get it from the page's closure scope isn't possible
+                // so we just navigate to linkedin.com first to reset the session state
+                await page.goto('https://www.linkedin.com', {
+                    waitUntil: 'domcontentloaded', timeout: 30000
+                }).catch(() => {});
+                await randomDelay(3000, 5000);
+                // Retry the original URL once
+                await page.goto(url, options);
+                await randomDelay(2000, 3000);
+                return true;
+            } catch (retryErr) {
+                console.warn(`   ⚠️ Retry after cookie clear also failed: ${retryErr.message.slice(0,60)}`);
+                return false;
+            }
+        }
+
+        console.warn(`   ⚠️ safeGoto error [${msg.slice(0, 100)}]`);
         await new Promise(r => setTimeout(r, 3000));
         return false;
     }
@@ -655,10 +679,18 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         console.log('🌐 Loading LinkedIn domain...');
         await safeGoto(page, 'https://www.linkedin.com', { timeout: 30000 });
 
-        const staleCookies = await page.cookies('https://www.linkedin.com').catch(() => []);
+        // Clear cookies for all LinkedIn domains to prevent redirect loops
+        const staleCookies = await page.cookies(
+            'https://www.linkedin.com',
+            'https://linkedin.com'
+        ).catch(() => []);
         for (const c of staleCookies) {
-            await page.deleteCookie({ name: c.name, domain: c.domain }).catch(() => {});
+            await page.deleteCookie({
+                name: c.name,
+                domain: c.domain || '.linkedin.com'
+            }).catch(() => {});
         }
+        console.log(`   🧹 Cleared ${staleCookies.length} stale cookies`);
 
         await page.setCookie({
             name: 'li_at',
