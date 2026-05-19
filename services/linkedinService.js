@@ -650,9 +650,15 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-        // ── Step 1: visit LinkedIn then set cookie ───────────────────────────
+        // ── Step 1: visit LinkedIn, clear stale cookies, set fresh li_at ────
+        // Stale cookies cause ERR_TOO_MANY_REDIRECTS — clear them all first.
         console.log('🌐 Loading LinkedIn domain...');
         await safeGoto(page, 'https://www.linkedin.com', { timeout: 30000 });
+
+        const staleCookies = await page.cookies('https://www.linkedin.com').catch(() => []);
+        for (const c of staleCookies) {
+            await page.deleteCookie({ name: c.name, domain: c.domain }).catch(() => {});
+        }
 
         await page.setCookie({
             name: 'li_at',
@@ -756,108 +762,57 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
         }
 
         // ── Step 4: scrape each profile ──────────────────────────────────────
+        // IMPORTANT: reuse same page — DO NOT open new tabs per profile.
+        // Opening a new tab per profile uses ~100MB RAM each and crashes
+        // Railway's 512MB container by profile 2 (Target.createTarget timed out).
         const leads = [];
 
         for (let i = 0; i < profileUrls.length; i++) {
             const profileUrl = profileUrls[i];
             console.log(`👤 Scraping profile ${i + 1}/${profileUrls.length}: ${profileUrl}`);
 
-            // ── Fresh page per profile — prevents detached frame errors ──────
-            let profilePage = null;
             try {
                 await randomDelay(5000, 9000);
 
-                // Open a brand new page for each profile
-                profilePage = await browser.newPage();
-
-                await profilePage.setRequestInterception(true);
-                profilePage.on('request', req => {
-                    const rt  = req.resourceType();
-                    const url = req.url();
-                    if (['media', 'font'].includes(rt)) { req.abort(); return; }
-                    if (rt === 'image') {
-                        if (url.includes('licdn.com')) req.continue();
-                        else req.abort();
-                        return;
-                    }
-                    req.continue();
-                });
-
-                await profilePage.evaluateOnNewDocument(() => {
-                    Object.defineProperty(navigator, 'webdriver',  { get: () => false });
-                    Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3] });
-                    Object.defineProperty(navigator, 'languages',  { get: () => ['en-US', 'en'] });
-                });
-
-                await profilePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-                await profilePage.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-
-                // Must visit LinkedIn domain first before cookie takes effect
-                await safeGoto(profilePage, 'https://www.linkedin.com', { timeout: 30000 });
-                await profilePage.setCookie({
-                    name: 'li_at', value: liAt,
-                    domain: '.linkedin.com', path: '/',
-                    httpOnly: true, secure: true, sameSite: 'None'
-                });
-
-                // Navigate to profile
-                const profOk = await safeGoto(profilePage, profileUrl, { timeout: 60000 });
+                const profOk = await safeGoto(page, profileUrl, { timeout: 60000 });
                 if (!profOk) {
                     console.warn(`   ⚠️ Could not load profile ${i + 1} — skipping`);
                     leads.push({ profileUrl, name: null, headline: null, location: null, company: null, about: null, profileImage: null });
-                    await profilePage.close().catch(() => {});
                     continue;
                 }
 
-                // Auth wall check
-                const currentUrl = await safeUrl(profilePage);
-                if (
-                    currentUrl.includes('/authwall') ||
-                    currentUrl.includes('/login')    ||
-                    currentUrl.includes('checkpoint') ||
-                    currentUrl.includes('/uas/')
-                ) {
-                    console.warn(`⚠️ Auth wall hit at profile ${i + 1} — stopping`);
-                    await profilePage.close();
+                const currentUrl = await safeUrl(page);
+                if (currentUrl.includes('/authwall') || currentUrl.includes('/login') ||
+                    currentUrl.includes('checkpoint') || currentUrl.includes('/uas/')) {
+                    console.warn(`⚠️ Auth wall at profile ${i + 1} — stopping`);
                     break;
                 }
 
-                // Wait for render
-                const renderWait = Math.floor(Math.random() * 4000) + 7000;
-                console.log(`   ⏳ Waiting ${Math.round(renderWait / 1000)}s...`);
-                await randomDelay(renderWait, renderWait + 2000);
+                // Wait for full render
+                await randomDelay(6000, 10000);
 
-                // Scroll to trigger lazy loading
-                for (const amount of [400, 400, 400, 400]) {
-                    await safeEval(profilePage, a => window.scrollBy(0, a), null, amount);
+                // Scroll to trigger lazy-loaded sections
+                for (const amount of [400, 500, 400, 500]) {
+                    await safeEval(page, a => window.scrollBy(0, a), null, amount);
                     await randomDelay(1500, 2500);
                 }
-                await safeEval(profilePage, () => window.scrollTo(0, 0), null);
+                await safeEval(page, () => window.scrollTo(0, 0), null);
                 await randomDelay(1000, 2000);
 
-                // Extract data
-                const profileData = await extractProfileData(profilePage);
-                console.log(`   ✅ Extracted: name=${profileData.name} company=${profileData.company} headline=${profileData.headline?.slice(0,40)}`);
+                const profileData = await extractProfileData(page);
+                console.log(`   ✅ name=${profileData.name || 'null'} company=${profileData.company || 'null'}`);
+
                 if (!profileData.name) {
-                    // Log page title to help debug extraction failures
-                    const title = await safeEval(profilePage, () => document.title, '');
-                    const url   = await safeUrl(profilePage);
-                    console.warn(`   ⚠️ No name extracted. Title: "${title}" URL: ${url.slice(0,80)}`);
+                    const title  = await safeEval(page, () => document.title, '');
+                    const landed = await safeUrl(page);
+                    console.warn(`   ⚠️ No name. Title="${title}" URL=${landed.slice(0, 80)}`);
                 }
+
                 leads.push({ profileUrl, ...profileData });
 
             } catch (err) {
-                console.warn(`⚠️ Failed to scrape ${profileUrl}:`, err.message);
-                leads.push({
-                    profileUrl,
-                    name: null, headline: null, location: null,
-                    company: null, about: null, profileImage: null
-                });
-            } finally {
-                // Always close the page — prevents frame leaks
-                if (profilePage && !profilePage.isClosed()) {
-                    await profilePage.close().catch(() => {});
-                }
+                console.warn(`⚠️ Profile ${i + 1} error: ${err.message.slice(0, 80)}`);
+                leads.push({ profileUrl, name: null, headline: null, location: null, company: null, about: null, profileImage: null });
             }
         }
 
