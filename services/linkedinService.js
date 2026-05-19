@@ -754,10 +754,6 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
 
             const navOk = await safeGoto(page, paginatedUrl, { timeout: 60000 });
 
-            // Log where we actually landed — critical for diagnosing blocks
-            const landedUrl = await safeEval(page, () => window.location.href, '');
-            console.log(`   📍 Landed: ${(landedUrl || 'unknown').slice(0, 100)}`);
-
             if (!navOk) {
                 console.warn(`   ⚠️ Navigation failed on page ${pageNum + 1} — skipping`);
                 await randomDelay(6000, 10000);
@@ -765,18 +761,46 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                 continue;
             }
 
-            // Detect auth wall even when navOk is true (LinkedIn redirects silently)
-            if (landedUrl && (landedUrl.includes('/authwall') || landedUrl.includes('/login') || landedUrl.includes('checkpoint'))) {
-                console.error('   ❌ Redirected to auth wall — session expired or IP blocked');
+            // Extra wait — LinkedIn fires JS redirects AFTER domcontentloaded.
+            // safeGoto already waits 2-3s but search pages need more time
+            // for the React app to mount and the frame to stabilise.
+            await randomDelay(4000, 6000);
+
+            // Use page.url() via try/catch — more reliable than safeEval here
+            // because safeEval itself can frame-error during the JS mount phase.
+            let landedUrl = '';
+            for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                    landedUrl = page.url();
+                    if (landedUrl && landedUrl !== 'about:blank' && !landedUrl.includes('chrome-error')) break;
+                } catch {}
+                await randomDelay(2000, 3000);
+                console.log(`   ⏳ Waiting for frame to stabilise (attempt ${attempt + 1})...`);
+            }
+            console.log(`   📍 Landed: ${landedUrl.slice(0, 100)}`);
+
+            // Detect auth wall
+            if (landedUrl.includes('/authwall') || landedUrl.includes('/login') || landedUrl.includes('checkpoint')) {
+                console.error('   ❌ Auth wall — session expired or IP blocked');
                 break;
             }
 
-            await safeEval(page, () => window.scrollBy(0, 600), null);
-            await randomDelay(2500, 3500);
-            await safeEval(page, () => window.scrollBy(0, 600), null);
-            await randomDelay(2500, 3500);
+            // Detect chrome error page — navigation actually failed silently
+            if (!landedUrl || landedUrl.includes('chrome-error') || landedUrl === 'about:blank') {
+                console.warn(`   ⚠️ Chrome error page on page ${pageNum + 1} — skipping`);
+                await randomDelay(5000, 8000);
+                pageNum++;
+                continue;
+            }
 
-            const pageUrls = await safeEval(page, () => {
+            // Scroll to trigger lazy-load
+            await safeEval(page, () => window.scrollBy(0, 600), null);
+            await randomDelay(3000, 4000);
+            await safeEval(page, () => window.scrollBy(0, 600), null);
+            await randomDelay(3000, 4000);
+
+            // Extract profile URLs — retry once if frame dies during evaluate
+            let pageUrls = await safeEval(page, () => {
                 const links = new Set();
                 document.querySelectorAll('a[href*="/in/"]').forEach(el => {
                     const href = el.href.split('?')[0].replace(/\/$/, '');
@@ -785,7 +809,23 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
                         links.add(href);
                 });
                 return [...links];
-            }, []);
+            }, null);
+
+            // If null (frame died), wait and retry once
+            if (pageUrls === null) {
+                console.warn(`   ⚠️ Frame died during URL extraction — waiting 5s and retrying`);
+                await randomDelay(5000, 7000);
+                pageUrls = await safeEval(page, () => {
+                    const links = new Set();
+                    document.querySelectorAll('a[href*="/in/"]').forEach(el => {
+                        const href = el.href.split('?')[0].replace(/\/$/, '');
+                        if (href && href.includes('linkedin.com/in/') &&
+                            !href.includes('/in/undefined') && !href.endsWith('/in/'))
+                            links.add(href);
+                    });
+                    return [...links];
+                }, []);
+            }
 
             console.log(`   Found ${pageUrls.length} profiles on page ${pageNum + 1}`);
 
@@ -796,7 +836,7 @@ async function scrapeLeads(uid, encryptedCookie, searchUrl, campaignId, maxLeads
 
             pageUrls.forEach(url => allProfileUrls.add(url));
             pageNum++;
-            await randomDelay(3000, 5000);
+            await randomDelay(4000, 6000);
         }
 
         const profileUrls = [...allProfileUrls].slice(0, maxLeads);
