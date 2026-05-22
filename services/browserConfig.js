@@ -1,132 +1,32 @@
 /**
- * browserConfig.js
- * Finds Chrome automatically across all environments:
- * - Railway (primary)
- * - Render.com
- * - Local Mac / Windows / Linux
+ * browserConfig.js — Playwright version
+ * LOCAL DEV: browser window opens so you can watch what's happening.
+ *            Set HEADLESS=true in .env to force headless locally.
+ * RAILWAY:   always headless (detected via env vars).
  */
 
-const fs   = require('fs');
-const path = require('path');
+const IS_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_SERVICE_NAME;
+const IS_RENDER  = !!process.env.RENDER;
+const IS_SERVER  = IS_RAILWAY || IS_RENDER || process.env.NODE_ENV === 'production';
 
-function findChrome() {
+function getLaunchConfig() {
+  const headless = IS_SERVER || process.env.HEADLESS === 'true';
 
-  // ── 0. Project-local .cache (set by .puppeteerrc.cjs) ────────────────────
-  // This is the most reliable — Puppeteer installs here via npx puppeteer browsers install
-  try {
-    const localBase = path.join(process.cwd(), '.cache', 'puppeteer', 'chrome');
-    if (fs.existsSync(localBase)) {
-      const versions = fs.readdirSync(localBase)
-        .filter(d => d.startsWith('linux-'))
-        .sort().reverse();
-      for (const v of versions) {
-        const p = path.join(localBase, v, 'chrome-linux64', 'chrome');
-        if (fs.existsSync(p)) {
-          console.log(`[browser] ✅ Local cache Chrome found at: ${p}`);
-          return p;
-        }
-      }
-    }
-  } catch {}
-
-  // ── 1. Railway — Nixpacks installs system Chromium ───────────────────────
-  const railwayPaths = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/google-chrome',
-    '/run/current-system/sw/bin/chromium',
-    '/nix/var/nix/profiles/default/bin/chromium',
-  ];
-
-  for (const p of railwayPaths) {
-    if (fs.existsSync(p)) {
-      console.log(`[browser] ✅ Railway Chrome found at: ${p}`);
-      return p;
-    }
+  if (!IS_SERVER) {
+    console.log('[browser] 🖥  Running in LOCAL mode —', headless ? 'headless' : 'browser window will open');
+    if (!headless) console.log('[browser]    Set HEADLESS=true in .env to run headless locally');
   }
-
-  // ── 2. Home directory .cache (Railway/Render fallback) ────────────────────
-  try {
-    const home = process.env.HOME || '/root';
-    const base = path.join(home, '.cache', 'puppeteer', 'chrome');
-    if (fs.existsSync(base)) {
-      const versions = fs.readdirSync(base)
-        .filter(d => d.startsWith('linux-'))
-        .sort().reverse();
-      for (const v of versions) {
-        const p = path.join(base, v, 'chrome-linux64', 'chrome');
-        if (fs.existsSync(p)) {
-          console.log(`[browser] ✅ Home cache Chrome found at: ${p}`);
-          return p;
-        }
-      }
-    }
-  } catch {}
-
-  // ── 3. Render.com — scan cache directory ─────────────────────────────────
-  try {
-    const base = '/opt/render/.cache/puppeteer/chrome';
-    if (fs.existsSync(base)) {
-      const versions = fs.readdirSync(base)
-        .filter(d => d.startsWith('linux-'))
-        .sort().reverse();
-      for (const v of versions) {
-        const p = path.join(base, v, 'chrome-linux64', 'chrome');
-        if (fs.existsSync(p)) {
-          console.log(`[browser] ✅ Render Chrome found at: ${p}`);
-          return p;
-        }
-      }
-    }
-  } catch {}
-
-  // ── 4. Mac local dev ──────────────────────────────────────────────────────
-  const macPaths = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  ];
-  for (const p of macPaths) {
-    if (fs.existsSync(p)) {
-      console.log(`[browser] ✅ Mac Chrome found at: ${p}`);
-      return p;
-    }
-  }
-
-  // ── 5. Windows local dev ──────────────────────────────────────────────────
-  const winPaths = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ];
-  for (const p of winPaths) {
-    try {
-      if (fs.existsSync(p)) {
-        console.log(`[browser] ✅ Windows Chrome found at: ${p}`);
-        return p;
-      }
-    } catch {}
-  }
-
-  console.log('[browser] ⚠️  No Chrome found — letting Puppeteer auto-detect');
-  return undefined;
-}
-
-function getLaunchConfig(extraArgs = []) {
-  const executablePath = findChrome();
 
   return {
-    headless: 'new',
-    protocolTimeout: 120000,  // ← fixes "Network.enable timed out"
-    ...(executablePath && { executablePath }),
+    headless,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--single-process',
-      '--no-zygote',
       '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-features=IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests',
+      '--disable-site-isolation-trials',
       '--disable-web-security',
       '--window-size=1280,800',
       '--disable-http2',
@@ -137,11 +37,12 @@ function getLaunchConfig(extraArgs = []) {
       '--disable-sync',
       '--metrics-recording-only',
       '--no-first-run',
+      '--disable-renderer-backgrounding',
+      '--disable-backgrounding-occluded-windows',
       '--js-flags=--max-old-space-size=512',
-      ...extraArgs,
+      ...(IS_SERVER ? ['--single-process', '--no-zygote'] : []),
     ],
-    defaultViewport: { width: 1280, height: 800 },
   };
 }
 
-module.exports = { getLaunchConfig, findChrome };
+module.exports = { getLaunchConfig, IS_SERVER };
