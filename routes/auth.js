@@ -39,12 +39,11 @@ router.post('/register', async (req, res) => {
             linkedinSession: null
         });
         await sendOtpEmail(email, otp);
-        const token = jwt.sign({ uid:userRef.id, email },process.env.JWT_SECRET,{ expiresIn: '7d' }
-        );
 
+        // ✅ Do NOT send token here — user must verify email first
+        // Token is only issued after /verify-email succeeds
         res.status(201).json({
             message: 'User registered. Please verify your email.',
-            token,  // ✅ returned here now
             uid: userRef.id
         });
 
@@ -74,6 +73,15 @@ router.post('/platform-login', async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
             return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Block login if email not verified
+        if (!user.isVerified) {
+            return res.status(403).json({
+                error: 'Please verify your email before logging in.',
+                uid: userDoc.id,
+                requiresVerification: true
+            });
         }
 
         const token = jwt.sign(
@@ -147,7 +155,14 @@ router.post('/verify-email', async (req, res) => {
             otpExpiry: null
         });
 
-        res.json({ message: 'Email verified successfully' });
+        // ✅ Now issue the token — email is confirmed
+        const token = jwt.sign(
+            { uid, email: user.email },
+            process.env.JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.json({ message: 'Email verified successfully', token, uid });
 
     } catch (err) {
         res.status(500).json({ error: err.message });

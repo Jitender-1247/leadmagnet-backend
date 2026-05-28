@@ -213,7 +213,7 @@ router.get('/:campaignId/leads', authMiddleware, async (req, res) => {
 // ── POST /api/v1/campaigns/:campaignId/import-leads ──────────────────────────
 router.post('/:campaignId/import-leads', authMiddleware, importLeadsLimiter, async (req, res) => {
   const { campaignId }        = req.params;
-  const { searchUrl, maxLeads, force } = req.body;
+  const { searchUrl, maxLeads } = req.body;
   const uid = req.user.uid;
 
   if (!searchUrl) return res.status(400).json({ error: 'searchUrl is required' });
@@ -241,7 +241,7 @@ router.post('/:campaignId/import-leads', authMiddleware, importLeadsLimiter, asy
 // ── POST /api/v1/campaigns/:campaignId/launch ─────────────────────────────────
 router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (req, res) => {
   const { campaignId }          = req.params;
-  const { searchUrl, maxLeads, force } = req.body;
+  const { searchUrl, maxLeads } = req.body;
   const uid                     = req.user.uid;
 
   if (!searchUrl) return res.status(400).json({ error: 'searchUrl is required' });
@@ -315,27 +315,22 @@ router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (re
         await campaignRef.update({ launchStatus: 'running' });
         console.log(`[launch] 🚀 Auto-starting campaign ${campaignId}`);
 
-        // force=true bypasses the queue and runs immediately regardless of time
-        if (force) {
-          console.log(`[launch] ⚡ Force mode — running immediately (bypassing queue)`);
+        const job = await enqueueJob(campaignId, uid);
+
+        if (job.runNow) {
           await runCampaign(campaignId);
-          await campaignRef.update({ launchStatus: 'done', launchError: null });
+          await campaignRef.update({
+            launchStatus: 'done',
+            launchError:  null,
+          });
           console.log(`[launch] ✅ Campaign completed`);
         } else {
-          const job = await enqueueJob(campaignId, uid);
-
-          if (job.runNow) {
-            await runCampaign(campaignId);
-            await campaignRef.update({ launchStatus: 'done', launchError: null });
-            console.log(`[launch] ✅ Campaign completed`);
-          } else {
-            await campaignRef.update({
-              launchStatus:    'queued',
-              launchScheduled: job.scheduledLabel,
-              launchError:     null,
-            });
-            console.log(`[launch] ⏰ Campaign queued for ${job.scheduledLabel}`);
-          }
+          await campaignRef.update({
+            launchStatus:    'queued',
+            launchScheduled: job.scheduledLabel,
+            launchError:     null,
+          });
+          console.log(`[launch] ⏰ Campaign queued for ${job.scheduledLabel}`);
         }
 
       } catch (err) {
@@ -352,6 +347,61 @@ router.post('/:campaignId/launch', authMiddleware, importLeadsLimiter, async (re
     if (!res.headersSent) {
       res.status(500).json({ error: err.message });
     }
+  }
+});
+
+// ── POST /api/v1/campaigns/:campaignId/run-now ────────────────────────────────
+// Force-runs campaign immediately using EXISTING leads — no scraping needed.
+// Bypasses safe hours and queue. Use from "Run Now" button in UI.
+router.post('/:campaignId/run-now', authMiddleware, async (req, res) => {
+  const { campaignId } = req.params;
+  const uid = req.user.uid;
+
+  try {
+    const campaignRef = db.collection('campaigns').doc(campaignId);
+    const campaignDoc = await campaignRef.get();
+
+    if (!campaignDoc.exists || campaignDoc.data().userId !== uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (campaignDoc.data().isRunning) {
+      return res.status(409).json({ error: 'Campaign is already running. Please wait.' });
+    }
+
+    // Check there are pending leads to process
+    const leadsSnap = await db.collection('leads')
+      .where('campaignId', '==', campaignId)
+      .where('status', '==', 'pending')
+      .limit(1)
+      .get();
+
+    if (leadsSnap.empty) {
+      return res.status(400).json({ error: 'No pending leads to process. Import leads first.' });
+    }
+
+    // Respond immediately
+    res.json({ success: true, status: 'running', message: '⚡ Running campaign now!' });
+
+    // Run in background with force=true to bypass safe hours
+    ;(async () => {
+      try {
+        const { runCampaign } = require('../services/automationService');
+        await runCampaign(campaignId, { force: true });
+        await campaignRef.update({ launchStatus: 'done' }).catch(() => {});
+        console.log(`[run-now] ✅ Campaign ${campaignId} completed`);
+      } catch (err) {
+        console.error(`[run-now] ❌ Error:`, err.message);
+        await campaignRef.update({
+          isRunning: false,
+          launchStatus: 'error',
+          launchError: err.message,
+        }).catch(() => {});
+      }
+    })();
+
+  } catch (err) {
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
@@ -536,46 +586,6 @@ router.delete('/:campaignId', authMiddleware, async (req, res) => {
     await ref.delete();
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── POST /api/v1/campaigns/:campaignId/run-now ───────────────────────────────
-// Force-runs the campaign immediately using existing leads — no scraping.
-// Used by the "Run Now" button when a campaign is queued outside safe hours.
-router.post('/:campaignId/run-now', authMiddleware, async (req, res) => {
-  const { campaignId } = req.params;
-  const uid = req.user.uid;
-
-  try {
-    const campaignRef = db.collection('campaigns').doc(campaignId);
-    const campaignDoc = await campaignRef.get();
-
-    if (!campaignDoc.exists || campaignDoc.data().userId !== uid) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    if (campaignDoc.data().isRunning) {
-      return res.status(409).json({ error: 'Campaign is already running' });
-    }
-
-    // Cancel any pending queue jobs first
-    const { cancelCampaignJobs } = require('../services/Queueservice');
-    await cancelCampaignJobs(campaignId).catch(() => {});
-
-    // Respond immediately, run in background
-    res.json({ success: true, message: '⚡ Running campaign now!' });
-
-    const { runCampaign } = require('../services/automationService');
-    runCampaign(campaignId)
-      .then(() => campaignRef.update({ launchStatus: 'done', launchError: null }))
-      .catch(err => {
-        console.error(`[run-now] Error:`, err.message);
-        campaignRef.update({ launchStatus: 'error', launchError: err.message });
-      });
-
-  } catch (err) {
-    console.error('[run-now] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

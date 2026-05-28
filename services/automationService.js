@@ -217,31 +217,27 @@ async function actionConnect(page, profileUrl, note, lead) {
   if (nav.blocked) return { success: false, message: 'Auth wall' };
 
   try {
-    // FIX: try ALL known Connect button patterns across LinkedIn layouts
-    // LinkedIn uses different aria-labels depending on degree, layout, and A/B test
+    // ── Find Connect button ───────────────────────────────────────────────────
     const connectSelectors = [
-      'button[aria-label^="Connect with"]',          // "Connect with John Doe"
-      'button[aria-label="Connect"]',                 // exact match
-      'button[aria-label*="Invite"][aria-label*="connect"]', // invite variant
-      'button[aria-label*="Connect"]',                // any containing Connect
+      'button[aria-label^="Connect with"]',
+      'button[aria-label="Connect"]',
+      'button[aria-label*="Invite"][aria-label*="connect"]',
+      'button[aria-label*="Connect"]',
     ];
 
     let connectBtn = null;
-    let connectVisible = false;
 
-    // First try all direct button selectors
     for (const sel of connectSelectors) {
       const btn = page.locator(sel).first();
       if (await btn.isVisible().catch(() => false)) {
         connectBtn = btn;
-        connectVisible = true;
         console.log(`   ✅ Connect button found: ${sel}`);
         break;
       }
     }
 
     // Try More actions menu if direct buttons not found
-    if (!connectVisible) {
+    if (!connectBtn) {
       const moreSelectors = [
         'button[aria-label*="More actions"]',
         'button[aria-label*="more options"]',
@@ -252,50 +248,76 @@ async function actionConnect(page, profileUrl, note, lead) {
         if (await moreBtn.isVisible().catch(() => false)) {
           await moreBtn.click();
           await sleep(clickDelay());
-          // After opening More menu, look for Connect option
           const menuConnect = page.locator('div[aria-label*="Connect"], span:text-is("Connect"), li:has-text("Connect") button').first();
           if (await menuConnect.isVisible().catch(() => false)) {
             connectBtn = menuConnect;
-            connectVisible = true;
-            console.log(`   ✅ Connect found in More menu`);
+            console.log('   ✅ Connect found in More menu');
           }
           break;
         }
       }
     }
 
-    if (!connectVisible) {
-      // Log all buttons for debugging
+    if (!connectBtn) {
       const visibleBtns = await page.$$eval('button', els =>
         els.map(e => e.getAttribute('aria-label') || e.innerText?.trim()).filter(Boolean).slice(0, 15)
       ).catch(() => []);
-      console.warn('   ⚠️ Connect not found. All buttons:', visibleBtns.join(' | '));
-
-      // Check if already connected / pending
+      console.warn('   ⚠️ Connect not found. Buttons:', visibleBtns.join(' | '));
       const alreadyConnected = visibleBtns.some(b =>
         b.toLowerCase().includes('message') ||
         b.toLowerCase().includes('pending') ||
         b.toLowerCase().includes('following')
       );
-      if (alreadyConnected) {
-        return { success: false, message: 'Already connected or pending' };
-      }
+      if (alreadyConnected) return { success: false, message: 'Already connected or pending' };
       return { success: false, message: 'Connect button not found' };
     }
 
     await connectBtn.click();
-    await sleep(clickDelay());
-    await sleep(1500);
+    await sleep(2000); // wait for modal to appear
 
-    // Handle "How do you know" modal
-    const howKnowBtn = page.locator('button[aria-label*="Other"], button[data-view-name*="connect-other"]').first();
-    if (await howKnowBtn.isVisible().catch(() => false)) {
-      await howKnowBtn.click();
-      await sleep(clickDelay());
-      console.log('   Bypassed "How do you know" modal');
+    // ── Handle "How do you know X?" modal ────────────────────────────────────
+    // LinkedIn shows this modal for 2nd/3rd degree connections.
+    // Must select a relationship option THEN click the modal's Connect button.
+    const howKnowModal = page.locator('[role="dialog"]').first();
+    const howKnowVisible = await howKnowModal.isVisible().catch(() => false);
+
+    if (howKnowVisible) {
+      // Try to select "Other" option inside the modal
+      const otherSelectors = [
+        'button[aria-label*="Other"]',
+        'button[data-view-name*="connect-other"]',
+        'label:has-text("Other")',
+        'input[value="OTHER"] + label',
+        'li:has-text("Other") button',
+      ];
+      let selectedOption = false;
+      for (const sel of otherSelectors) {
+        const optBtn = howKnowModal.locator(sel).first();
+        if (await optBtn.isVisible().catch(() => false)) {
+          await optBtn.click();
+          await sleep(1000);
+          selectedOption = true;
+          console.log('   Bypassed "How do you know" modal — selected Other');
+          break;
+        }
+      }
+
+      // After selecting an option (or if no option needed),
+      // click the Connect/Send button INSIDE the modal
+      if (selectedOption) {
+        const modalConnectBtn = howKnowModal.locator(
+          'button[aria-label*="Connect"], button[aria-label*="Send"], button.artdeco-button--primary'
+        ).first();
+        if (await modalConnectBtn.isVisible().catch(() => false)) {
+          await modalConnectBtn.click();
+          await sleep(2000);
+          console.log('✅ Connection sent after "How do you know" modal');
+          return { success: true };
+        }
+      }
     }
 
-    // Add note if provided
+    // ── Add note if provided ──────────────────────────────────────────────────
     if (note) {
       const addNoteBtn = page.locator('button[aria-label*="Add a note"]').first();
       if (await addNoteBtn.isVisible().catch(() => false)) {
@@ -311,39 +333,71 @@ async function actionConnect(page, profileUrl, note, lead) {
       }
     }
 
-    // Find Send button
+    // ── Find Send / confirm button ─────────────────────────────────────────────
+    // IMPORTANT: scope search to modal dialog first to avoid hitting
+    // the page's own Connect button which is still visible behind the modal.
     const sendSelectors = [
       'button[aria-label*="Send now"]',
       'button[aria-label*="Send invitation"]',
       'button[aria-label*="Send without a note"]',
-      'button[aria-label*="Connect"]',
+      // NOTE: intentionally removed 'button[aria-label*="Connect"]' here
+      // because it matches the page-level Connect button behind the modal
     ];
 
     let sendBtn = null;
-    for (const sel of sendSelectors) {
-      const btn = page.locator(sel).first();
-      if (await btn.isVisible().catch(() => false)) {
-        sendBtn = btn;
-        console.log(`   Found send btn: ${sel}`);
-        break;
+
+    // 1st: look inside modal dialog
+    const modalDialog = page.locator('[role="dialog"]').first();
+    if (await modalDialog.isVisible().catch(() => false)) {
+      for (const sel of sendSelectors) {
+        const btn = modalDialog.locator(sel).first();
+        if (await btn.isVisible().catch(() => false)) {
+          sendBtn = btn;
+          console.log(`   Found send btn in modal: ${sel}`);
+          break;
+        }
+      }
+      // Fallback: any primary action button inside the modal
+      if (!sendBtn) {
+        const primaryBtn = modalDialog.locator('button.artdeco-button--primary').first();
+        if (await primaryBtn.isVisible().catch(() => false)) {
+          sendBtn = primaryBtn;
+          const label = await primaryBtn.getAttribute('aria-label').catch(() => '');
+          const text  = await primaryBtn.innerText().catch(() => '');
+          console.log(`   Found primary modal button: "${label || text}"`);
+        }
+      }
+    }
+
+    // 2nd: page-wide fallback (but NOT 'button[aria-label*="Connect"]')
+    if (!sendBtn) {
+      for (const sel of sendSelectors) {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible().catch(() => false)) {
+          sendBtn = btn;
+          console.log(`   Found send btn page-wide: ${sel}`);
+          break;
+        }
       }
     }
 
     if (!sendBtn) {
-      const modalBtns = await page.$$eval('button', els => els.map(e => e.getAttribute('aria-label') || e.innerText).filter(Boolean));
-      console.warn('   ⚠️ Send button not found. Modal buttons:', modalBtns.join(' | '));
-      return { success: false, message: 'Send button not found' };
+      const allBtns = await page.$$eval('button', els =>
+        els.map(e => e.getAttribute('aria-label') || e.innerText?.trim()).filter(Boolean)
+      ).catch(() => []);
+      console.warn('   ⚠️ Send button not found. All buttons:', allBtns.join(' | '));
+      return { success: false, message: 'Send button not found in connect modal' };
     }
 
     await sendBtn.click();
     await sleep(2000);
 
-    // Verify: Connect button should change to Pending
+    // Verify sent
     const pendingBtn = page.locator('button[aria-label*="Pending"], button[aria-label*="Message"]').first();
     if (await pendingBtn.isVisible().catch(() => false)) {
-      console.log('✅ Connection request confirmed — button changed to Pending/Message');
+      console.log('✅ Connection confirmed — button changed to Pending/Message');
     } else {
-      console.log('✅ Connection request sent (button state unclear)');
+      console.log('✅ Connection request sent (button state not verified)');
     }
 
     return { success: true };
@@ -524,7 +578,7 @@ async function executeStep(page, step, lead, profileUrl) {
 }
 
 // ── Main campaign runner ──────────────────────────────────────────────────────
-async function runCampaign(campaignId) {
+async function runCampaign(campaignId, { force = false } = {}) {
   const campaignRef = db.collection('campaigns').doc(campaignId);
   const campaignDoc = await campaignRef.get();
 
@@ -545,7 +599,7 @@ async function runCampaign(campaignId) {
   const userId = campaign.userId;
 
   try {
-    if (!isSafeToRun()) {
+    if (!force && !isSafeToRun()) {
       const nextWindow = getNextSafeWindow();
       console.log(`[automation] Outside safe hours. Next window: ${nextWindow}`);
       await campaignRef.update({ isRunning: false, nextScheduledAt: nextWindow });

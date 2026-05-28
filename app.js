@@ -14,13 +14,14 @@ app.set('trust proxy', 1);
 
 
 // 2. Apply CORS to all routes
-app.use(cors({
+const corsOptions = {
   origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-}));
-app.options('*', cors());
+};
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
 app.use(logger('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
