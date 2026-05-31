@@ -7,6 +7,14 @@ const authMiddleware = require('../middleware/authMiddleware');
 const { sendOtpEmail } = require('./emailService');
 const bcrypt = require('bcrypt');
 
+// ── Shared cookie config ───────────────────────────────────────────────────
+const cookieOptions = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'strict' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000
+};
+
 const generateOtp = (length = 6) => {
     const min = 10 ** (length - 1);
     const max = 9 * min;
@@ -22,7 +30,11 @@ router.post('/register', async (req, res) => {
             .where('email', '==', email).get();
 
         if (!existing.empty) {
-            return res.status(400).json({ error: 'User already exists' });
+            const existingUser = existing.docs[0].data();
+            if (existingUser.isVerified) {
+                return res.status(400).json({ error: 'User already exists' });
+            }
+            await existing.docs[0].ref.delete();
         }
 
         const otp = generateOtp();
@@ -38,10 +50,9 @@ router.post('/register', async (req, res) => {
             createdAt: new Date().toISOString(),
             linkedinSession: null
         });
+
         await sendOtpEmail(email, otp);
 
-        // ✅ Do NOT send token here — user must verify email first
-        // Token is only issued after /verify-email succeeds
         res.status(201).json({
             message: 'User registered. Please verify your email.',
             uid: userRef.id
@@ -57,7 +68,6 @@ router.post('/register', async (req, res) => {
 router.post('/platform-login', async (req, res) => {
     const { email, password } = req.body;
     try {
-        // ✅ Fetch by email only — can't query by hashed password
         const snapshot = await db.collection('users')
             .where('email', '==', email)
             .get();
@@ -69,13 +79,11 @@ router.post('/platform-login', async (req, res) => {
         const userDoc = snapshot.docs[0];
         const user = userDoc.data();
 
-        // ✅ Compare plain password against stored hash
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
-        // Block login if email not verified
         if (!user.isVerified) {
             return res.status(403).json({
                 error: 'Please verify your email before logging in.',
@@ -90,39 +98,39 @@ router.post('/platform-login', async (req, res) => {
             { expiresIn: '7d' }
         );
 
-        res.json({ token, uid: userDoc.id });
+        res.cookie('token', token, cookieOptions)
+           .json({ uid: userDoc.id });
+
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// POST /api/v1/auth/linkedin-connect — Step 1: trigger OTP
+// POST /api/v1/auth/linkedin-connect
 router.post('/linkedin-connect', authMiddleware, async (req, res) => {
     const { email, password } = req.body;
-    const uid = req.user.uid; // ✅ from token
+    const uid = req.user.uid;
 
     if (!email || !password) {
         return res.status(400).json({ error: 'Email and password are required' });
     }
 
     const result = await initiateLinkedInLogin(uid, email, password);
-    console.log("result", result);
     if (result.requiresOtp) return res.status(202).json(result);
     if (!result.success) return res.status(400).json(result);
     res.json(result);
 });
 
-// POST /api/v1/auth/linkedin-verify-otp — Step 2: submit OTP
+// POST /api/v1/auth/linkedin-verify-otp
 router.post('/linkedin-verify-otp', authMiddleware, async (req, res) => {
     const { otp } = req.body;
-    const uid = req.user.uid; // ✅ from token
+    const uid = req.user.uid;
 
     if (!otp) {
         return res.status(400).json({ error: 'OTP is required' });
     }
 
     const result = await submitLinkedInOtp(uid, otp);
-    console.log("result otp", result);
     if (!result.success) return res.status(400).json(result);
     res.json(result);
 });
@@ -155,14 +163,14 @@ router.post('/verify-email', async (req, res) => {
             otpExpiry: null
         });
 
-        // ✅ Now issue the token — email is confirmed
         const token = jwt.sign(
             { uid, email: user.email },
             process.env.JWT_SECRET,
             { expiresIn: '7d' }
         );
 
-        res.json({ message: 'Email verified successfully', token, uid });
+        res.cookie('token', token, cookieOptions)
+           .json({ message: 'Email verified successfully', uid });
 
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -186,15 +194,31 @@ router.post('/resend-otp', async (req, res) => {
 
         const email = userSnap.data().email;
 
-        await userRef.update({
-            emailOtp: otp,
-            otpExpiry: expiry
-        });
-
+        await userRef.update({ emailOtp: otp, otpExpiry: expiry });
         await sendOtpEmail(email, otp);
-
         res.json({ message: 'OTP resent' });
 
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/v1/auth/logout
+router.post('/logout', (req, res) => {
+    res.clearCookie('token', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? 'strict' : 'lax'
+    }).json({ message: 'Logged out successfully' });
+});
+
+// GET /api/v1/auth/me — verify session is still valid
+router.get('/me', authMiddleware, async (req, res) => {
+    try {
+        const userSnap = await db.collection('users').doc(req.user.uid).get();
+        if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
+        const { password, emailOtp, otpExpiry, linkedinSession, ...safeUser } = userSnap.data();
+        res.json({ uid: req.user.uid, ...safeUser });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
