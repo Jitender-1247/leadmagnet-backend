@@ -99,7 +99,7 @@ router.post('/platform-login', async (req, res) => {
         );
 
         res.cookie('token', token, cookieOptions)
-           .json({ uid: userDoc.id });
+           .json({ uid: userDoc.id ,token});
 
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -170,7 +170,7 @@ router.post('/verify-email', async (req, res) => {
         );
 
         res.cookie('token', token, cookieOptions)
-           .json({ message: 'Email verified successfully', uid });
+           .json({ message: 'Email verified successfully', uid , token });
 
     } catch (err) {
         res.status(500).json({ error: err.message });
