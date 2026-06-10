@@ -16,7 +16,11 @@ app.set('trust proxy', 1);
 
 // 2. Apply CORS to all routes
 const corsOptions = {
-  origin: 'https://d1svf5jx051w0q.cloudfront.net',
+  origin: [
+    'http://localhost:5173',                        // local dev
+    'http://localhost:5174',                        // vite sometimes uses this
+    'https://d1svf5jx051w0q.cloudfront.net',       // your deployed frontend
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
