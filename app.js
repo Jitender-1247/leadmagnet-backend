@@ -16,7 +16,7 @@ app.set('trust proxy', 1);
 
 // 2. Apply CORS to all routes
 const corsOptions = {
-  origin: true,
+  origin: 'https://d1svf5jx051w0q.cloudfront.net',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
