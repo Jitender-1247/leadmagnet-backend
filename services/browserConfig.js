@@ -21,6 +21,7 @@ function getLaunchConfig() {
     headless,
     args: [
       '--no-sandbox',
+      '--single-process',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
